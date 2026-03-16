@@ -51,10 +51,33 @@ def tokenizer(model_id):
 
 @pytest.fixture
 def sglang_model(tokenizer, sglang_base_url):
+    # Discover valid parser names for this sglang version
+    try:
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+        reasoning_parsers = list(ReasoningParser.DetectorMap.keys())
+    except Exception:
+        reasoning_parsers = []
+    try:
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        # FunctionCallParser expects tool list at init; just check registry exists
+        tool_call_parser = "hermes"  # hermes is the most common default
+    except Exception:
+        tool_call_parser = "hermes"
+
+    reasoning_parser = "deepseek-r1"  # common default
+    for name in ("deepseek-r1", "qwen3"):
+        if name in reasoning_parsers:
+            reasoning_parser = name
+            break
+    if reasoning_parsers and reasoning_parser not in reasoning_parsers:
+        reasoning_parser = reasoning_parsers[0]
+
     config = SGLangModelConfig(
         name="test-integration",
         api_base=sglang_base_url,
         tokenizer=tokenizer,
+        tool_call_parser=tool_call_parser,
+        reasoning_parser=reasoning_parser,
         top_p=None,
         per_instance_cost_limit=0,
         total_cost_limit=0,
@@ -222,22 +245,20 @@ class TestMultiTurnSegments:
     def test_loss_mask_preserves_prior_segments(self, sglang_model):
         """Adding new segments should not change the loss_mask of prior segments."""
         history = History([{"role": "user", "content": "Say one word."}])
-        sglang_model.query(history, n=1)
+        result1 = sglang_model.query(history, n=1)
 
         mask_after_first = list(sglang_model.token_manager.loss_mask)
         n_first = len(mask_after_first)
 
-        # Second turn
-        result = sglang_model.query(
-            History(
-                list(history)
-                + [
-                    {"role": "assistant", "content": sglang_model.token_manager.token_ids[-1:]},
-                    {"role": "user", "content": "Say another word."},
-                ]
-            ),
-            n=1,
+        # Second turn: extend history with assistant response + user follow-up
+        history2 = History(
+            list(history)
+            + [
+                {"role": "assistant", "content": result1["message"]},
+                {"role": "user", "content": "Say another word."},
+            ]
         )
+        sglang_model.query(history2, n=1)
 
         mask_after_second = sglang_model.token_manager.loss_mask
         # First N elements should be unchanged
