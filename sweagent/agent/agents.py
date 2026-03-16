@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import time
+import traceback
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
@@ -30,6 +31,7 @@ from sweagent.agent.models import (
     get_model,
 )
 from sweagent.agent.problem_statement import ProblemStatement, ProblemStatementConfig
+from sweagent.agent.token_manager import TokenManager
 from sweagent.agent.reviewer import (
     ChooserRetryLoop,
     RetryLoopConfig,
@@ -43,6 +45,7 @@ from sweagent.exceptions import (
     ContextWindowExceededError,
     CostLimitExceededError,
     FormatError,
+    InstanceCallLimitExceededError,
     TotalCostLimitExceededError,
 )
 from sweagent.tools.parsing import (
@@ -1023,7 +1026,7 @@ class DefaultAgent(AbstractAgent):
         # attributes (e.g., if we want to requery the model for a bash syntax error, we
         # need to have the previous model output to format the requery template)
         step = StepOutput()
-        step.query = copy.deepcopy(history)
+        step.query = copy.deepcopy(self.input_ids)
         try:
             # Forward model and get actions
             self._chook.on_model_query(messages=history, agent=self.name)
@@ -1291,4 +1294,355 @@ class DefaultAgent(AbstractAgent):
         # Here we want to return the "global" information (e.g., submission should
         # be the best submission instead of the last one, etc.), so we get it from the traj file
         data = self.get_trajectory_data()
+        return AgentRunResult(info=data["info"], trajectory=data["trajectory"])
+
+
+class RLTokenAgent(DefaultAgent):
+    def __init__(
+        self,
+        *,
+        templates: TemplateConfig,
+        tools: ToolHandler,
+        history_processors: list[HistoryProcessor],
+        model: AbstractModel,
+        max_requeries: int = 3,
+        name: str = "main",
+        _catch_errors: bool = True,
+        _always_require_zero_exit_code: bool = False,
+        action_sampler_config: ActionSamplerConfig | None = None,
+        state: Any | None = None,
+    ):
+        super().__init__(
+            templates=templates,
+            tools=tools,
+            history_processors=history_processors,
+            model=model,
+            max_requeries=max_requeries,
+            name=name,
+            _catch_errors=_catch_errors,
+            _always_require_zero_exit_code=_always_require_zero_exit_code,
+            action_sampler_config=action_sampler_config,
+        )
+        self.state = state
+        self.token_manager = getattr(model, "token_manager", TokenManager())
+        self.init_input_ids: list[int] = []
+        self.rollout_routed_experts: list[list[int]] = []
+        self._error_logs: list[dict[str, Any]] = []
+
+    def _require_tokenizer(self):
+        if self.state is None or not hasattr(self.state, "tokenizer"):
+            raise ValueError("RLTokenAgent requires state.tokenizer for token tracking.")
+        return self.state.tokenizer
+
+    @property
+    def input_ids(self) -> list[int]:
+        return self.token_manager.token_ids
+
+    @property
+    def loss_mask(self) -> list[int]:
+        return self.token_manager.loss_mask
+
+    @property
+    def rollout_log_probs(self) -> list[float]:
+        return self.token_manager.logprobs
+
+    def _append_history(self, item: dict[str, Any]) -> None:
+        self._chook.on_query_message_added(**item)
+        self.history.append(item)  # type: ignore[arg-type]
+
+
+    def setup(
+        self,
+        env: SWEEnv,
+        problem_statement: ProblemStatement | ProblemStatementConfig,
+        output_dir: Path = Path("."),
+    ) -> None:
+        model = self.model
+        if hasattr(model, "reset_rollout_state"):
+            model.reset_rollout_state()
+        self.token_manager = getattr(model, "token_manager", self.token_manager)
+        self.init_input_ids = []
+        self.rollout_routed_experts = []
+        self._error_logs = []
+
+        super().setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
+
+    def add_step_to_history(self, step: StepOutput) -> None:
+        content = step.output if not step.tool_calls else (step.thought or step.output)
+        if content is None:
+            content = ""
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content,
+            "thought": step.thought,
+            "action": step.action,
+            "agent": self.name,
+            "message_type": "action",
+            "thinking_blocks": step.thinking_blocks,
+            "reasoning_content": step.reasoning_content,
+            "output_tokens": step.output_tokens,
+            "rollout_log_probs": step.rollout_log_probs,
+            "rollout_routed_experts": step.rollout_routed_experts,
+        }
+        if step.tool_calls:
+            assistant_message["tool_calls"] = step.tool_calls
+        self._append_history(assistant_message)
+
+        elided_chars = 0
+        if step.observation.strip() == "":
+            templates = [self.templates.next_step_no_output_template]
+        elif len(step.observation) > self.templates.max_observation_length:
+            templates = [self.templates.next_step_truncated_observation_template]
+            elided_chars = len(step.observation) - self.templates.max_observation_length
+        else:
+            templates = [self.templates.next_step_template]
+        self._add_templated_messages_to_history(
+            templates,
+            observation=step.observation,
+            elided_chars=elided_chars,
+            max_observation_length=self.templates.max_observation_length,
+            tool_call_ids=step.tool_call_ids,
+            **step.state,
+        )
+
+    def get_model_requery_history(
+        self, error_template: str, *, output: str, **kwargs: str | int | float | bool | None
+    ) -> list[dict[str, Any]]:
+        format_dict = {**kwargs, **self._get_format_dict()}
+        error_template = Template(error_template).render(**format_dict)
+        self.logger.warning(f"{error_template}")
+        return copy.deepcopy(self.messages)
+
+    def forward(self, history: list[dict[str, Any]]) -> StepOutput:
+        if self._total_execution_time > self.tools.config.total_execution_timeout:
+            raise _TotalExecutionTimeExceeded()
+
+        step = StepOutput()
+        step.query = copy.deepcopy(self.input_ids)
+        try:
+            self._chook.on_model_query(messages=self.messages, agent=self.name)
+            if self._action_sampler is not None:
+                assert self._problem_statement is not None
+                best = self._action_sampler.get_action(
+                    problem_statement=self._problem_statement,
+                    trajectory=self.trajectory,
+                    history=self.messages,
+                )
+                output = best.completion
+                step.extra_info.update(best.extra_info)
+            else:
+                output = self.model.query(history)  # type: ignore[arg-type]
+            step.output = output["message"]
+            if not self.init_input_ids:
+                new_prompt_token_ids = output.get("new_prompt_token_ids", []) or []
+                if isinstance(new_prompt_token_ids, list):
+                    self.init_input_ids = list(new_prompt_token_ids)
+            step.output_tokens = output.get("output_tokens", []) or []
+            step.thinking_blocks = output.get("thinking_blocks", [])
+            step.reasoning_content = output.get("reasoning_content", None)
+            step.rollout_log_probs = output.get("rollout_log_probs", []) or []
+            step.rollout_routed_experts = output.get("rollout_routed_experts", []) or []
+            step.thought, step.action = self.tools.parse_actions(output)
+            if output.get("tool_calls") is not None:
+                step.tool_call_ids = [call["id"] for call in output["tool_calls"]]
+                step.tool_calls = output["tool_calls"]
+            self._chook.on_actions_generated(step=step)
+            return self.handle_action(step)
+        except Exception as error:
+            if step.action == step.thought == "":
+                step.thought = step.output
+            error.step = step  # type: ignore[attr-defined]
+            raise
+
+    def forward_with_handling(self, history: list[dict[str, Any]]) -> StepOutput:
+        def handle_error_with_autosubmission(exception: Exception, exit_status: str, message: str) -> StepOutput:
+            full_traceback = traceback.format_exc()
+            current_step = len(self.trajectory) + 1
+            self._error_logs.append(
+                {
+                    "step": current_step,
+                    "error_type": type(exception).__name__,
+                    "exit_status": exit_status,
+                    "message": str(exception),
+                    "n_requeries": None,
+                    "traceback": full_traceback,
+                }
+            )
+            self.logger.warning(message)
+            step = getattr(exception, "step", StepOutput())
+            step.thought = message
+            step.exit_status = exit_status
+            step.output = message
+            step.done = True
+            return self.attempt_autosubmission_after_error(step)
+
+        def handle_error_with_retry(exception: Exception, template: str, n_requeries: int) -> list[dict[str, Any]]:
+            full_traceback = traceback.format_exc()
+            current_step = len(self.trajectory) + 1
+            exception_message = getattr(exception, "message", "")
+            if not exception_message:
+                try:
+                    exception_message = exception.args[0]
+                except (IndexError, AttributeError):
+                    pass
+            self._error_logs.append(
+                {
+                    "step": current_step,
+                    "error_type": "retry",
+                    "exception_type": type(exception).__name__,
+                    "message": str(exception_message),
+                    "n_requeries": n_requeries,
+                    "traceback": full_traceback,
+                }
+            )
+            self.logger.warning("Requerying model after %s (%dth requery)", type(exception).__name__, n_requeries)
+            step: StepOutput = getattr(exception, "step", StepOutput())
+            self.add_step_to_trajectory(step)
+            return self.get_model_requery_history(
+                error_template=template,
+                **step.to_template_format_dict(),
+                **getattr(exception, "extra_info", {}),
+                exception_message=exception_message,
+            )
+
+        last_requery_exception: Exception | None = None
+        n_format_fails = 0
+        while n_format_fails < self.max_requeries:
+            try:
+                return self.forward(history)
+            except KeyboardInterrupt:
+                raise
+            except EOFError:
+                raise
+            except FormatError as error:
+                last_requery_exception = error
+                n_format_fails += 1
+                history = handle_error_with_retry(error, self.tools.config.format_error_template, n_format_fails)
+            except _BlockedActionError as error:
+                last_requery_exception = error
+                n_format_fails += 1
+                history = handle_error_with_retry(
+                    error, self.tools.config.filter.blocklist_error_template, n_format_fails
+                )
+            except ContentPolicyViolationError as error:
+                last_requery_exception = error
+                self.logger.warning("Content policy violation, trying to resample")
+                n_format_fails += 1
+            except BashIncorrectSyntaxError as error:
+                last_requery_exception = error
+                n_format_fails += 1
+                history = handle_error_with_retry(error, self.templates.shell_check_error_template, n_format_fails)
+            except _RetryWithOutput as error:
+                last_requery_exception = error
+                n_format_fails += 1
+                history = handle_error_with_retry(error, self.templates.next_step_template, n_format_fails)
+            except _RetryWithoutOutput as error:
+                last_requery_exception = error
+                self.logger.warning("Retry without output, trying to resample")
+                n_format_fails += 1
+            except _ExitForfeit as error:
+                return handle_error_with_autosubmission(error, "exit_forfeit", "Exiting due to forfeit")
+            except _TotalExecutionTimeExceeded as error:
+                self.logger.exception("Exiting due to total execution time exceeded", exc_info=True)
+                return handle_error_with_autosubmission(
+                    error, "exit_total_execution_time", "Exit due to total execution time exceeded"
+                )
+            except CommandTimeoutError as error:
+                self.logger.exception("Exiting due to multiple consecutive command timeouts", exc_info=True)
+                return handle_error_with_autosubmission(
+                    error, "exit_command_timeout", "Exit due to multiple consecutive command timeouts"
+                )
+            except ContextWindowExceededError as error:
+                return handle_error_with_autosubmission(error, "exit_context", "Exit due to context window")
+            except InstanceCallLimitExceededError as error:
+                return handle_error_with_autosubmission(
+                    error, "exit_max_iter_out", "Exit due to max iteration out of limit"
+                )
+            except TotalCostLimitExceededError:
+                raise
+            except CostLimitExceededError as error:
+                return handle_error_with_autosubmission(error, "exit_cost", "Exit due to cost limit")
+            except RetryError as error:
+                self.logger.exception("Exiting due to retry error: %s", error, exc_info=True)
+                return handle_error_with_autosubmission(error, "exit_api", f"Exit due to retry error: {error}")
+            except SwerexException as error:
+                self.logger.exception("Exiting due to environment error: %s", error, exc_info=True)
+                return handle_error_with_autosubmission(
+                    error, "exit_environment_error", f"Exit due to environment error: {error}"
+                )
+            except RuntimeError as error:
+                self.logger.exception("Exiting due to runtime error: %s", error, exc_info=True)
+                return handle_error_with_autosubmission(error, "exit_error", f"Exit due to runtime error: {error}")
+            except Exception as error:
+                self.logger.exception("Exiting due to unknown error: %s", error, exc_info=True)
+                return handle_error_with_autosubmission(error, "exit_error", f"Exit due to unknown error: {error}")
+
+        self.logger.exception("Exit due to repeated format/blocklist/bash syntax errors", exc_info=True)
+        exception_to_use = last_requery_exception
+        if exception_to_use is None:
+            exception_to_use = RuntimeError("Exit due to repeated format/blocklist/bash syntax errors")
+            exception_to_use.step = StepOutput()  # type: ignore[attr-defined]
+        return handle_error_with_autosubmission(
+            exception_to_use,
+            "exit_format",
+            "Exit due to repeated format/blocklist/bash syntax errors",
+        )
+
+    def add_step_to_trajectory(self, step: StepOutput) -> None:
+        trajectory_step = TrajectoryStep(
+            {
+                "action": step.action,
+                "observation": step.observation,
+                "response": step.output,
+                "thought": step.thought,
+                "execution_time": step.execution_time,
+                "state": step.state,
+                "query": step.query,
+                "extra_info": step.extra_info,
+                "reasoning_content": step.reasoning_content,
+                "output_tokens": step.output_tokens,
+                "rollout_log_probs": step.rollout_log_probs,
+                "rollout_routed_experts": step.rollout_routed_experts,
+            }
+        )
+        self.trajectory.append(trajectory_step)
+
+    def step(self) -> StepOutput:
+        assert self._env is not None
+        self._chook.on_step_start()
+
+        n_step = len(self.trajectory) + 1
+        self.logger.info("=" * 25 + f" STEP {n_step} " + "=" * 25)
+        step_output = self.forward_with_handling(self.messages)
+        self.add_step_to_history(step_output)
+
+        self.info["submission"] = step_output.submission
+        self.info["exit_status"] = step_output.exit_status  # type: ignore[index]
+        self.info.update(self._get_edited_files_with_context(patch=step_output.submission or ""))  # type: ignore[arg-type]
+        self.info["model_stats"] = self.model.stats.model_dump()
+
+        self.add_step_to_trajectory(step_output)
+
+        self._chook.on_step_done(step=step_output, info=self.info)
+        return step_output
+
+    def run(
+        self,
+        env: SWEEnv,
+        problem_statement: ProblemStatement | ProblemStatementConfig,
+        output_dir: Path = Path("."),
+    ) -> AgentRunResult:
+        self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
+
+        self._chook.on_run_start()
+        step_output = StepOutput()
+        while not step_output.done:
+            step_output = self.step()
+            self.save_trajectory()
+        self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
+
+        self.logger.info("Trajectory saved to %s", self.traj_path)
+        data = self.get_trajectory_data()
+        data["info"]["error_logs"] = self._error_logs
+        data["info"]["response_turn"] = len(self.trajectory)
         return AgentRunResult(info=data["info"], trajectory=data["trajectory"])

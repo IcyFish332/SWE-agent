@@ -46,6 +46,13 @@ class AbstractAgentHook:
         action: str = "",
         tool_calls: list[dict[str, str]] | None = None,
         tool_call_ids: list[str] | None = None,
+        name: str | None = None,
+        tool_call_id: str | None = None,
+        thinking_blocks: list[dict[str, str]] | None = None,
+        reasoning_content: str = "",
+        output_tokens: list[int] | None = None,
+        rollout_log_probs: list[float] | None = None,
+        rollout_routed_experts: list[list[int]] | None = None,
     ): ...
 
     def on_setup_done(self): ...
@@ -116,10 +123,16 @@ class CombinedAgentHook(AbstractAgentHook):
         action: str = "",
         tool_calls: list[dict[str, str]] | None = None,
         tool_call_ids: list[str] | None = None,
+        name: str | None = None,
+        tool_call_id: str | None = None,
         thinking_blocks: list[dict[str, str]] | None = None,
+        reasoning_content: str = "",
+        output_tokens: list[int] | None = None,
+        rollout_log_probs: list[float] | None = None,
+        rollout_routed_experts: list[list[int]] | None = None,
     ):
         for hook in self.hooks:
-            hook.on_query_message_added(
+            kwargs = dict(
                 agent=agent,
                 role=role,
                 content=content,
@@ -129,7 +142,38 @@ class CombinedAgentHook(AbstractAgentHook):
                 action=action,
                 tool_calls=tool_calls,
                 tool_call_ids=tool_call_ids,
+                thinking_blocks=thinking_blocks,
+                name=name,
+                tool_call_id=tool_call_id,
+                reasoning_content=reasoning_content,
+                output_tokens=output_tokens,
+                rollout_log_probs=rollout_log_probs,
+                rollout_routed_experts=rollout_routed_experts,
             )
+            fallback_keys = [
+                'rollout_routed_experts',
+                'rollout_log_probs',
+                'output_tokens',
+                'reasoning_content',
+                'tool_call_id',
+                'name',
+                'thinking_blocks',
+            ]
+            while True:
+                try:
+                    hook.on_query_message_added(**kwargs)
+                    break
+                except TypeError as e:
+                    if 'unexpected keyword argument' not in str(e):
+                        raise
+                    removed = False
+                    for key in fallback_keys:
+                        if f"'{key}'" in str(e) and key in kwargs:
+                            kwargs.pop(key, None)
+                            removed = True
+                            break
+                    if not removed:
+                        raise
 
     def on_setup_done(self):
         return super().on_setup_done()

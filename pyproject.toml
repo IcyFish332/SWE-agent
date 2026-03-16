@@ -102,6 +102,7 @@ namespaces = false
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "ctf: marks EnIGMA tests for using SWE-agent on capture the flag (CTF) challenges",
+    "sglang: marks tests requiring a running SGLang server (deselect with '-m \"not sglang\"')",
 ]
 testpaths = [
     "tests"

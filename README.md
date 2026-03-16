@@ -1,145 +1,184 @@
-<p align="center">
-  <a href="https://swe-agent.com/latest/">
-    <img src="assets/swe-agent-banner.png" alt="swe-agent.com" style="height: 7em" />
-  </a>
-</p>
+# SWE-agent (Project SWE RL Fork)
 
-<p align="center">
-<a href="https://swe-agent.com/latest/"><img src="https://img.shields.io/badge/Docs-green?style=for-the-badge&logo=materialformkdocs&logoColor=white" alt="Docs"></a>
-<a href="https://join.slack.com/t/swe-bench/shared_invite/zt-36pj9bu5s-o3_yXPZbaH2wVnxnss1EkQ"><img src="https://img.shields.io/badge/Slack-4A154B?style=for-the-badge&logo=slack&logoColor=white" alt="Slack"></a>
-<a href="https://arxiv.org/abs/2405.15793"><img src="https://img.shields.io/badge/arxiv-2405.15793-red?style=for-the-badge&logo=arxiv&logoColor=white&labelColor=black" alt="arxiv 2405.15793"></a>
-</p>
+这是当前项目中作为 `3rdparty` 依赖保留的一份 **SWE-agent fork**。它的目标不是继续承载整套训练脚本，而是作为一个尽量贴近上游、但已经补齐 **RL / rollout 训练主链路** 所需能力的运行时基座。
 
-<p align="center">
-  <a href="https://mini-swe-agent.com/latest/">
-    <img src="assets/warning.png" alt="mini-swe-agent.com" style="height: 7em" />
-  </a>
-</p>
+## 为什么要改造 SWE-agent
 
-> [!warning]
-> Most of our current development effort is on [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent/),
-> which has superseded SWE-agent. It matches the performance performance of SWE-agent, while being
-> much simpler.
-> See the [FAQ](https://mini-swe-agent.com/latest/faq/) for more details about the differences.
-> Our general recommendation is to use mini-SWE-agent instead of SWE-agent going forward.
+原始 SWE-agent 的主假设是：
+- agent 以消息级 history 驱动；
+- 模型输出主要按文本/工具调用消费；
+- 重点在“解题运行”而不是“训练轨迹保真”。
 
+但接入 `slime` 做 SWE 任务强化学习训练时，我们需要额外保证：
+- **Token-In / Token-Out** 轨迹可用；
+- rollout 中的 `loss_mask`、`logprobs`、`output_tokens` 可直接进入训练；
+- tool-calling 的解析链路尽量严格，减少 heuristic repair；
+- 多轮 agent/tool/env 交互中，token 轨迹不要因为本地重分词而漂移；
+- `swerl/` 可以把它当作 library 使用，而不是继续维护一套重改版源码。
 
-SWE-agent enables your language model of choice (e.g. GPT-4o or Claude Sonnet 4) to autonomously use tools to
-[fix issues in real GitHub repositories](https://swe-agent.com/latest/usage/hello_world),
-[find cybersecurity vulnerabilities](https://enigma-agent.com/), or
-[perform any custom task](https://swe-agent.com/latest/usage/coding_challenges).
+所以当前这份 fork 的改造重点，是把 SWE-agent 补成一个更适合 RL rollout 的 runtime。
 
-* ✅ **State of the art** on SWE-bench among open-source projects
-* ✅ **Free-flowing & generalizable**: Leaves maximal agency to the LM
-* ✅ **Configurable & fully documented**: Governed by a single `yaml` file
-* ✅ **Made for research**: Simple & hackable by design
+## 当前 fork 的核心改造
 
-SWE-agent is built and maintained by researchers from Princeton University and Stanford University.
+### 1. RL token rollout agent
 
-## 📣 News
+当前新增的核心 agent 是：
+- `sweagent.agent.agents.RLTokenAgent`
 
-* July 24: [Mini-SWE-Agent](https://github.com/SWE-agent/mini-SWE-agent) achieves 65% on SWE-bench verified in 100 lines of python!
-* May 2: [SWE-agent-LM-32b](https://github.com/SWE-bench/SWE-smith) achieves open-weights SOTA on SWE-bench
-* Feb 28: [SWE-agent 1.0 + Claude 3.7 is SoTA on SWE-Bench full](https://x.com/KLieret/status/1895487966409298067)
-* Feb 25: [SWE-agent 1.0 + Claude 3.7 is SoTA on SWE-bench verified](https://x.com/KLieret/status/1894408819670733158)
-* Feb 13: [Releasing SWE-agent 1.0: SoTA on SWE-bench light & tons of new features](https://x.com/KLieret/status/1890048205448220849)
-* Dec 7: [An interview with the SWE-agent & SWE-bench team](https://www.youtube.com/watch?v=fcr8WzeEXyk)
+它负责：
+- 承接 SWE-agent 原本的 step loop / tool execution / trajectory 逻辑；
+- 暴露训练需要的：
+  - `input_ids`
+  - `loss_mask`
+  - `rollout_log_probs`
+  - `rollout_routed_experts`
+  - `error_logs`
+  - `response_turn`
+- 与 `SGLangModel` 配合，形成 token-level rollout 主链路。
 
-## 🚀 Get started!
+### 2. SGLang model backend
 
-👉 Try SWE-agent in your browser: [![Open in GitHub Codespaces](https://img.shields.io/badge/Open_in_GitHub_Codespaces-gray?logo=github)](https://codespaces.new/SWE-agent/SWE-agent) ([more information](https://swe-agent.com/latest/installation/codespaces/))
+当前新增的核心 model backend 是：
+- `sweagent.agent.models.SGLangModelConfig`
+- `sweagent.agent.models.SGLangModel`
 
-Read our [documentation][docs] to learn more:
+它负责：
+- 直接对接 SGLang `/generate`；
+- 返回：
+  - `output_tokens`
+  - `rollout_log_probs`
+  - `rollout_routed_experts`
+- 使用：
+  - `tool_call_parser`
+  - `reasoning_parser`
+  - `message_separator`
+- 在 model 内部维护 **增量 tokenization 状态**，减少 retokenization drift。
 
-* [Installation](https://swe-agent.com/latest/installation/source/)
-* [Hello world from the command line](https://swe-agent.com/latest/usage/hello_world/)
-* [Benchmarking on SWE-bench](https://swe-agent.com/latest/usage/batch_mode/)
-* [Frequently Asked Questions](https://swe-agent.com/latest/faq/)
+### 3. 增量 tokenization 与 token trajectory
 
-[docs]: https://swe-agent.com
+当前实现不是简单地让 agent 对每条 message 单独 `apply_chat_template` 后拼接，而是引入了：
+- `sweagent.agent.token_manager.TokenManager`
 
-## SWE-agent for offensive cybersecurity (EnIGMA) <a name="enigma"></a>
+并把更严格的增量 prompt token 计算放到 `SGLangModel` 里：
+- 首轮：完整 prompt tokenize；
+- 后续轮次：只对新增消息计算 prompt token 增量；
+- 可选 debug invariant：
+  - `debug_check_incremental_tokens`
 
-<img src="https://github.com/user-attachments/assets/84599168-11a7-4776-8a49-33dbf0758bb2" height="80px"></img>
+这条链路的目的，是尽量向 `strands-sglang` 的 token 保真思路靠拢。
 
-[SWE-agent: EnIGMA][enigma] is a mode for solving offensive cybersecurity (capture the flag) challenges.
-EnIGMA achieves state-of-the-art results on multiple cybersecurity benchmarks (see [leaderboard](https://enigma-agent.com/#results)).
-Please use [SWE-agent 0.7](https://github.com/SWE-agent/SWE-agent/tree/v0.7) while we update EnIGMA for 1.0.
+### 4. Response parsing
 
-[enigma]: https://enigma-agent.com
-[SWE-bench]: https://github.com/SWE-bench/SWE-bench
-[nyu-ctf]: https://arxiv.org/abs/2406.05590
+当前 response parsing 已收敛到 model 层，不再放在 `swerl/`：
+- `sweagent.agent.response_parsing.parse_tool_calls_with_sglang(...)`
 
-In addition, you might be interested in our other projects:
+它负责：
+- 用 SGLang 的 `ReasoningParser` 拆 reasoning；
+- 用 SGLang 的 `FunctionCallParser` 解析 tool calls；
+- 输出统一的：
+  - `message`
+  - `tool_calls`
+  - `reasoning_content`
 
+## 当前与 `swerl` / `slime` 的分工
 
-<div align="center">
-  <a href="https://github.com/SWE-agent/mini-SWE-agent"><img src="docs/assets/mini_logo_text_below.svg" alt="Mini-SWE-Agent" height="120px"></a>
-   &nbsp;&nbsp;
-  <a href="https://github.com/SWE-agent/SWE-ReX"><img src="docs/assets/swerex_logo_text_below.svg" alt="SWE-ReX" height="120px"></a>
-   &nbsp;&nbsp;
-  <a href="https://github.com/SWE-bench/SWE-bench"><img src="docs/assets/swebench_logo_text_below.svg" alt="SWE-bench" height="120px"></a>
-  &nbsp;&nbsp;
-  <!-- <a href="https://github.com/SWE-agent/SWE-agent"><img src="docs/assets/sweagent_logo_text_below.svg" alt="SWE-agent" height="120px"></a> -->
-  <a href="https://github.com/SWE-bench/SWE-smith"><img src="docs/assets/swesmith_logo_text_below.svg" alt="SWE-smith" height="120px"></a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/SWE-bench/sb-cli"><img src="docs/assets/sbcli_logo_text_below.svg" alt="sb-cli" height="120px"></a>
-</div>
+### 放在 `3rdparty/SWE-agent` 的能力
 
-## Contributions <a name="contributions"></a>
+这份 fork 里保留的是 **runtime 必需能力**：
+- `RLTokenAgent`
+- `SGLangModel`
+- token rollout types / hooks 扩展
+- response parsing
+- 增量 tokenization / token manager
 
-If you'd like to contribute to the codebase, we welcome [issues](https://github.com/SWE-agent/SWE-agent/issues) and [pull requests](https://github.com/SWE-agent/SWE-agent/pulls)! For larger code changes, we always encourage discussion in issues first.
+### 不放在 `3rdparty/SWE-agent` 的能力
 
-## Citation & contact <a name="citation"></a>
+这些能力已经放在项目自己的 `swerl/`：
+- rollout 入口
+- reward bridge
+- SWE-bench / env glue
+- slime config 对接
+- sample 回填
+- 训练脚本 / 实验脚本
 
-SWE-agent is an academic project started at Princeton University by John Yang*, Carlos E. Jimenez*, Alexander Wettig, Kilian Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir Press.
-Contact person: [John Yang](https://john-b-yang.github.io/), [Carlos E. Jimenez](http://www.carlosejimenez.com/), and [Kilian Lieret](https://www.lieret.net/) (Email: johnby@stanford.edu, carlosej@cs.princeton.edu, kl5675@princeton.edu).
+也就是说：
+- `3rdparty/SWE-agent` = runtime 基座
+- `swerl/` = RL 项目主逻辑
 
-If you found this work helpful, please consider citing it using the following:
+## 当前主配置字段
 
-<details>
-<summary> SWE-agent citation</summary>
+当前 `SGLangModelConfig` 与根配置主线使用这些字段：
+- `tool_call_parser`
+- `reasoning_parser`
+- `message_separator`
+- `debug_check_incremental_tokens`
 
-```bibtex
-@inproceedings{yang2024sweagent,
-  title={{SWE}-agent: Agent-Computer Interfaces Enable Automated Software Engineering},
-  author={John Yang and Carlos E Jimenez and Alexander Wettig and Kilian Lieret and Shunyu Yao and Karthik R Narasimhan and Ofir Press},
-  booktitle={The Thirty-eighth Annual Conference on Neural Information Processing Systems},
-  year={2024},
-  url={https://arxiv.org/abs/2405.15793}
-}
+对应 YAML 位于：
+- `configs/swe/default.yaml`
+
+## 当前重点文件
+
+如果要理解当前 fork 的关键改造，优先看：
+- `sweagent/agent/agents.py`
+- `sweagent/agent/models.py`
+- `sweagent/agent/token_manager.py`
+- `sweagent/agent/response_parsing.py`
+- `sweagent/types.py`
+- `sweagent/agent/hooks/abstract.py`
+
+## 当前状态总结
+
+目前这份 fork 已经不是”团队旧实验仓库的完整重放”，而是一次 **有选择的、围绕 RL 主链路的最小 runtime 回迁**。
+
+就当前项目而言，它已经能够支撑：
+- `slime -> swerl -> RLTokenAgent -> SGLangModel -> SWE env/reward`
+
+如果后续继续精简，下一步通常会落在：
+- 继续清理历史兼容字段；
+- 继续加强增量 tokenization 的 invariant 与测试；
+- 尽量把 fork 维持在最小 patch surface。
+
+## 测试
+
+本 fork 为 RL 改造部分新增了专项测试，覆盖 `TokenManager`、`SGLangModel`、`RLTokenAgent`、`response_parsing` 四个模块。
+
+### 单元测试（无需外部服务）
+
+```bash
+cd 3rdparty/SWE-agent
+
+# 运行全部 RL 相关单元测试
+pytest tests/test_token_manager.py tests/test_response_parsing.py tests/test_sglang_model.py tests/test_rl_token_agent.py -v
+
+# 运行全部非慢速、非 SGLang 服务的测试（含上游原有测试）
+pytest tests/ -m “not slow and not sglang” -v
 ```
-</details>
 
-If you used the summarizer, interactive commands or the offensive cybersecurity capabilities in SWE-agent, please also consider citing:
+测试文件：
 
-<details>
-<summary>EnIGMA citation</summary>
+| 文件 | 覆盖范围 | 外部依赖 |
+|------|---------|---------|
+| `tests/test_token_manager.py` | TokenManager 全属性 / 多轮 segment / loss_mask | 无 |
+| `tests/test_response_parsing.py` | `_detect_think_and_return_ori_think` + `parse_tool_calls_with_sglang`（真实 sglang parser） | sglang |
+| `tests/test_sglang_model.py` | `_extract_logprobs` / `_build_payload` / `tokenize_prompt_messages` / `_single_query` 等 | unittest.mock |
+| `tests/test_rl_token_agent.py` | property delegation / setup reset / forward / add_step_to_history | unittest.mock, DummyRuntime |
 
-```bibtex
-@misc{abramovich2024enigmaenhancedinteractivegenerative,
-      title={EnIGMA: Enhanced Interactive Generative Model Agent for CTF Challenges},
-      author={Talor Abramovich and Meet Udeshi and Minghao Shao and Kilian Lieret and Haoran Xi and Kimberly Milner and Sofija Jancheska and John Yang and Carlos E. Jimenez and Farshad Khorrami and Prashanth Krishnamurthy and Brendan Dolan-Gavitt and Muhammad Shafique and Karthik Narasimhan and Ramesh Karri and Ofir Press},
-      year={2024},
-      eprint={2409.16165},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2409.16165},
-}
+### 集成测试（需要运行中的 SGLang 服务）
+
+```bash
+# 需要先启动 SGLang 推理服务，然后：
+pytest tests/test_sglang_integration.py --sglang-base-url http://<host>:<port> -v
+
+# 或通过环境变量
+export SGLANG_BASE_URL=http://localhost:30000
+pytest tests/test_sglang_integration.py -v
 ```
-</details>
 
+集成测试内容：
 
-## 🪪 License <a name="license"></a>
-MIT. Check `LICENSE`.
-
-
-<div align="center">
-
-[![Pytest](https://github.com/SWE-agent/SWE-agent/actions/workflows/pytest.yaml/badge.svg)](https://github.com/SWE-agent/SWE-agent/actions/workflows/pytest.yaml)
-[![build-docs](https://github.com/SWE-agent/SWE-agent/actions/workflows/build-docs.yaml/badge.svg)](https://github.com/SWE-agent/SWE-agent/actions/workflows/build-docs.yaml)
-[![codecov](https://codecov.io/gh/SWE-agent/SWE-agent/graph/badge.svg?token=18XAVDK365)](https://codecov.io/gh/SWE-agent/SWE-agent)
-[![pre-commit.ci status](https://results.pre-commit.ci/badge/github/SWE-agent/SWE-agent/main.svg)](https://results.pre-commit.ci/latest/github/SWE-agent/SWE-agent/main)
-[![Markdown links](https://github.com/SWE-agent/SWE-agent/actions/workflows/check-links-periodic.yaml/badge.svg)](https://github.com/SWE-agent/SWE-agent/actions/workflows/check-links-periodic.yaml)
-
-</div>
+| 测试类 | 验证目标 |
+|--------|---------|
+| `TestTITOConsistency` | token_ids / loss_mask / logprobs 长度一致性，loss_mask 二值性，logprobs 非占位符 |
+| `TestIncrementalTokenization` | 增量分词 token 数 < 全量重分词；debug_check_incremental_tokens 无 drift |
+| `TestRetokenizationDrift` | encode(decode(token_ids)) == token_ids 往返一致性 |
+| `TestMultiTurnSegments` | 两轮对话后 segment 模式为 [P, R, P, R]；新增 segment 不改变历史 loss_mask |

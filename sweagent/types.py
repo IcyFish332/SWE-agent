@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 
 class StepOutput(BaseModel):
-    query: list[dict] = [{}]
+    query: list[dict[str, Any]] | list[int] = Field(default_factory=list)
     thought: str = ""
     action: str = ""
     output: str = ""
@@ -26,6 +26,10 @@ class StepOutput(BaseModel):
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_ids: list[str] | None = None
     thinking_blocks: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None
+    output_tokens: list[int] = []
+    rollout_log_probs: list[float] = []
+    rollout_routed_experts: list[list[int]] = []
 
     """State of the environment at the end of the step"""
     extra_info: dict[str, Any] = {}
@@ -44,12 +48,16 @@ class StepOutput(BaseModel):
 class TrajectoryStep(TypedDict):
     action: str
     observation: str
-    response: str
+    response: str | None
     state: dict[str, str]
-    thought: str
+    thought: str | None
     execution_time: float
-    query: list[dict[str, Any]]
+    query: list[dict[str, Any]] | list[int]
     extra_info: dict[str, Any]
+    reasoning_content: str | None
+    output_tokens: list[int] | None
+    rollout_log_probs: list[float] | None
+    rollout_routed_experts: list[list[int]] | None
 
 
 # required fields go here
@@ -70,6 +78,7 @@ class HistoryItem(_HistoryItem, total=False):
     tags: list[str]
     cache_control: dict[str, Any] | None
     thinking_blocks: list[dict[str, Any]] | None
+    output_tokens: list[int] | None
 
     """HistoryProcessors can add these tags to enable special processing"""
 
@@ -95,6 +104,10 @@ class AgentInfo(TypedDict, total=False):
     swe_agent_version: str
     swe_rex_version: str
     swe_rex_hash: str
+    error_logs: list[dict[str, Any]]
+    rollout_log_probs: list[float] | None
+    rollout_routed_experts: list[list[int]] | None
+    response_turn: int | None
 
 
 class AgentRunResult(BaseModel):

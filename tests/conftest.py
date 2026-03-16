@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,15 @@ from pathlib import Path
 
 import pytest
 from swerex.deployment.config import DockerDeploymentConfig, DummyDeploymentConfig
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--sglang-base-url",
+        action="store",
+        default=os.environ.get("SGLANG_BASE_URL"),
+        help="SGLang server base URL for integration tests (e.g. http://localhost:30000)",
+    )
 
 from sweagent.environment.repo import LocalRepoConfig
 from sweagent.environment.swe_env import EnvironmentConfig, SWEEnv

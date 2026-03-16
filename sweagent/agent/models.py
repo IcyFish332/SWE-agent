@@ -10,8 +10,9 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from threading import Lock
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Iterable, Literal, Optional
 
+import requests
 import litellm
 import litellm.types.utils
 from pydantic import BaseModel as PydanticBaseModel
@@ -36,6 +37,8 @@ from sweagent.exceptions import (
     ModelConfigurationError,
     TotalCostLimitExceededError,
 )
+from sweagent.agent.response_parsing import parse_tool_calls_with_sglang
+from sweagent.agent.token_manager import TokenManager
 from sweagent.tools.tools import ToolConfig
 from sweagent.types import History, HistoryItem
 from sweagent.utils.log import get_logger
@@ -260,8 +263,20 @@ class HumanThoughtModelConfig(HumanModelConfig):
     model_config = ConfigDict(extra="forbid")
 
 
+class SGLangModelConfig(GenericAPIModelConfig):
+    tokenizer: Any = None
+    tool_call_parser: str = "qwen25"
+    reasoning_parser: str = "qwen25"
+    message_separator: str = ""
+    debug_check_incremental_tokens: bool = False
+    return_routed_experts: bool = False
+
+    model_config = ConfigDict(extra="forbid")
+
+
 ModelConfig = Annotated[
-    GenericAPIModelConfig
+    SGLangModelConfig
+    | GenericAPIModelConfig
     | ReplayModelConfig
     | InstantEmptySubmitModelConfig
     | HumanModelConfig
@@ -296,6 +311,7 @@ class InstanceStats(PydanticBaseModel):
     tokens_sent: int = 0
     tokens_received: int = 0
     api_calls: int = 0
+    context: int = 0
 
     def __add__(self, other: InstanceStats) -> InstanceStats:
         return InstanceStats(
@@ -317,7 +333,7 @@ class AbstractModel(ABC):
         self.stats = InstanceStats()
 
     @abstractmethod
-    def query(self, history: History, action_prompt: str = "> ") -> dict: ...
+    def query(self, history: History | list[int], action_prompt: str = "> ") -> dict: ...
 
     @property
     def instance_cost_limit(self) -> float:
@@ -872,11 +888,400 @@ class LiteLLMModel(AbstractModel):
         return messages
 
 
+class SGLangModel(AbstractModel):
+    def __init__(self, args: SGLangModelConfig, tools: ToolConfig):
+        self.config: SGLangModelConfig = args.model_copy(deep=True)
+        self.stats = InstanceStats()
+        self.tools = tools
+        self.logger = get_logger("swea-lm", emoji="🤖")
+        self.tool_call_parser = self.config.tool_call_parser
+        self.reasoning_parser = self.config.reasoning_parser or self.tool_call_parser
+        self.model_max_input_tokens = (
+            self.config.max_input_tokens if self.config.max_input_tokens is not None else 126_976
+        )
+        self.model_max_output_tokens = (
+            self.config.max_output_tokens if self.config.max_output_tokens is not None else 4096
+        )
+        self.token_manager = TokenManager()
+        self._processed_message_count = 0
+
+    @property
+    def instance_cost_limit(self) -> float:
+        return self.config.per_instance_cost_limit
+
+    def reset_rollout_state(self) -> None:
+        self.token_manager.reset()
+        self._processed_message_count = 0
+
+    def _update_stats(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
+        with GLOBAL_STATS_LOCK:
+            GLOBAL_STATS.total_cost += cost
+        self.stats.instance_cost += cost
+        self.stats.tokens_sent += input_tokens
+        self.stats.tokens_received += output_tokens
+        self.stats.context = input_tokens + output_tokens
+        self.stats.api_calls += 1
+
+        if 0 < self.config.total_cost_limit < GLOBAL_STATS.total_cost:
+            raise TotalCostLimitExceededError("Total cost limit exceeded")
+        if 0 < self.config.per_instance_cost_limit < self.stats.instance_cost:
+            raise InstanceCostLimitExceededError("Instance cost limit exceeded")
+        if 0 < self.config.per_instance_call_limit < self.stats.api_calls:
+            raise InstanceCallLimitExceededError("Per instance call limit exceeded")
+
+    def _sleep(self) -> None:
+        elapsed_time = time.time() - GLOBAL_STATS.last_query_timestamp
+        if elapsed_time < self.config.delay:
+            time.sleep(self.config.delay - elapsed_time)
+        with GLOBAL_STATS_LOCK:
+            GLOBAL_STATS.last_query_timestamp = time.time()
+
+    def _build_headers(self, api_key: str | None) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    def _raise_for_http_error(self, error: requests.HTTPError) -> None:
+        response = error.response
+        if response is None:
+            raise error
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = response.text
+        message = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
+        lowered = message.lower()
+        if "context length" in lowered or "max context" in lowered or "context window" in lowered:
+            raise ContextWindowExceededError(message) from error
+        if "content policy" in lowered or "policy violation" in lowered or "safety" in lowered:
+            raise ContentPolicyViolationError(message) from error
+        raise error
+
+    def _build_payload(
+        self,
+        tokens: Optional[Iterable[int]],
+        *,
+        temperature: float | None = None,
+        return_logprob: bool = True,
+        logprob_start_len: int | None = None,
+    ) -> dict[str, Any]:
+        sampling_params: dict[str, Any] = {
+            "skip_special_tokens": False,
+            "max_new_tokens": self.model_max_output_tokens,
+            "temperature": self.config.temperature if temperature is None else temperature,
+        }
+        if self.config.top_p is not None:
+            sampling_params["top_p"] = self.config.top_p
+        if self.config.stop:
+            sampling_params["stop"] = self.config.stop
+        for key in ("top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty"):
+            if key in self.config.completion_kwargs and self.config.completion_kwargs[key] is not None:
+                sampling_params[key] = self.config.completion_kwargs[key]
+
+        payload: dict[str, Any] = {
+            "sampling_params": sampling_params,
+            "return_logprob": return_logprob,
+            "stream": False,
+            "input_ids": list(tokens or []),
+        }
+        if logprob_start_len is not None:
+            payload["logprob_start_len"] = logprob_start_len
+        if self.config.return_routed_experts:
+            payload["return_routed_experts"] = True
+        return payload
+
+    def _history_to_messages(self, history: History) -> list[dict[str, Any]]:
+        history = copy.deepcopy(history)
+
+        def get_role(history_item: HistoryItem) -> str:
+            if history_item["role"] == "system":
+                return "user" if self.config.convert_system_to_user else "system"
+            return history_item["role"]
+
+        messages: list[dict[str, Any]] = []
+        for history_item in history:
+            role = get_role(history_item)
+            if role == "tool":
+                tool_call_ids = history_item.get("tool_call_ids")
+                message = {
+                    "role": role,
+                    "content": history_item["content"],
+                    "tool_call_id": tool_call_ids[0] if tool_call_ids else None,
+                }
+            elif (tool_calls := history_item.get("tool_calls")) is not None:
+                message = {"role": role, "content": history_item["content"], "tool_calls": tool_calls}
+            else:
+                message = {"role": role, "content": history_item["content"]}
+            if "cache_control" in history_item:
+                message["cache_control"] = history_item["cache_control"]
+            if "reasoning_content" in history_item and history_item["reasoning_content"] is not None:
+                message["reasoning_content"] = history_item["reasoning_content"]
+            if "thinking_blocks" in history_item and history_item["thinking_blocks"] is not None:
+                message["thinking_blocks"] = history_item["thinking_blocks"]
+            messages.append(message)
+        return messages
+
+    def _sort_incremental_history(self, history: History) -> History:
+        sorted_history: History = []
+        tool_buffer: list[HistoryItem] = []
+
+        def flush_tool_buffer() -> None:
+            nonlocal tool_buffer
+            if not tool_buffer:
+                return
+            tool_buffer = sorted(
+                tool_buffer,
+                key=lambda item: (item.get("tool_call_ids") or [""])[0],
+            )
+            sorted_history.extend(tool_buffer)
+            tool_buffer = []
+
+        for item in history:
+            if item.get("role") == "tool":
+                tool_buffer.append(item)
+            else:
+                flush_tool_buffer()
+                sorted_history.append(item)
+        flush_tool_buffer()
+        return sorted_history
+
+    def _tokenize_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        tools: list[dict] | None = None,
+    ) -> list[int]:
+        return list(
+            self.config.tokenizer.apply_chat_template(
+                conversation=messages,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                return_dict=False,
+            )
+        )
+
+    def tokenize_prompt_messages(self, history: History) -> list[int] | None:
+        messages = self._history_to_messages(history)
+        if len(self.token_manager) == 0:
+            return self._tokenize_messages(messages, add_generation_prompt=True, tools=self.tools.tools)
+
+        if len(history) > self._processed_message_count:
+            new_history = self._sort_incremental_history(history[self._processed_message_count :])
+            fake_history: History = [
+                {
+                    "role": "user",
+                    "content": "ONLY FOR INCREMENTAL TOKENIZATION",
+                    "message_type": "observation",
+                }
+            ]
+            fake_messages = self._history_to_messages(fake_history)
+            full_ids = self._tokenize_messages(
+                fake_messages + self._history_to_messages(new_history),
+                add_generation_prompt=True,
+            )
+            prefix_ids = self._tokenize_messages(
+                fake_messages,
+                add_generation_prompt=False,
+            )
+            separator_ids = []
+            if self.config.message_separator:
+                separator_ids = list(
+                    self.config.tokenizer.encode(self.config.message_separator, add_special_tokens=False)
+                )
+            return separator_ids + full_ids[len(prefix_ids) :]
+
+        return None
+
+    def _validate_incremental_tokens(self, history: History, new_prompt_token_ids: list[int] | None) -> None:
+        if not self.config.debug_check_incremental_tokens:
+            return
+        expected = self._tokenize_messages(
+            self._history_to_messages(history), add_generation_prompt=True, tools=self.tools.tools
+        )
+        actual = self.token_manager.token_ids + (new_prompt_token_ids or [])
+        if expected != actual:
+            raise AssertionError(
+                f"Incremental tokenization drift detected: expected {len(expected)} tokens, got {len(actual)}"
+            )
+
+    def parse_response(self, text: str) -> dict[str, Any]:
+        parsed = parse_tool_calls_with_sglang(
+            text=text,
+            tools=self.tools.tools,
+            tool_call_parser=self.tool_call_parser,
+            reasoning_parser=self.reasoning_parser,
+        )
+        output: dict[str, Any] = {"message": parsed["message"]}
+        if parsed.get("tool_calls"):
+            output["tool_calls"] = parsed["tool_calls"]
+        if parsed.get("reasoning_content"):
+            output["reasoning_content"] = parsed["reasoning_content"]
+        return output
+
+    def _extract_logprobs(self, response: dict[str, Any], key: str) -> list[float] | None:
+        meta_info = response.get("meta_info", {})
+        values = meta_info.get(key) or response.get(key)
+        if not isinstance(values, list) or not values:
+            return None
+        out: list[float] = []
+        for item in values:
+            if isinstance(item, list) and item and isinstance(item[0], (int, float)):
+                out.append(float(item[0]))
+            elif isinstance(item, dict) and isinstance(item.get("logprob"), (int, float)):
+                out.append(float(item["logprob"]))
+            elif isinstance(item, (int, float)):
+                out.append(float(item))
+        return out or None
+
+    def _single_query(self, history: History, n: int | None = None, temperature: float | None = None) -> list[dict]:
+        self._sleep()
+        new_prompt_token_ids = self.tokenize_prompt_messages(history)
+        self._validate_incremental_tokens(history, new_prompt_token_ids)
+        input_ids = self.token_manager.token_ids + (new_prompt_token_ids or [])
+        input_tokens = len(input_ids)
+        if (
+            self.model_max_input_tokens is not None
+            and self.model_max_input_tokens > 0
+            and input_tokens > self.model_max_input_tokens
+        ):
+            raise ContextWindowExceededError(
+                f"Input tokens {input_tokens} exceed max tokens {self.model_max_input_tokens}"
+            )
+
+        payload = self._build_payload(
+            input_ids,
+            temperature=temperature,
+            return_logprob=True,
+            logprob_start_len=0,
+        )
+        api_key = self.config.choose_api_key()
+        headers = self._build_headers(api_key)
+        try:
+            response = requests.post(
+                f"{self.config.api_base}/generate",
+                json=payload,
+                headers=headers,
+                timeout=self.config.completion_kwargs.get("timeout", 1800),
+            )
+            response.raise_for_status()
+        except requests.HTTPError as error:
+            self._raise_for_http_error(error)
+        data = response.json()
+
+        output_tokens = data.get("output_ids") or []
+        if not isinstance(output_tokens, list):
+            output_tokens = []
+
+        output_logprobs = self._extract_logprobs(data, "output_token_logprobs") or [0.0] * len(output_tokens)
+        if len(output_logprobs) < len(output_tokens):
+            output_logprobs.extend([0.0] * (len(output_tokens) - len(output_logprobs)))
+        elif len(output_logprobs) > len(output_tokens):
+            output_logprobs = output_logprobs[: len(output_tokens)]
+
+        input_logprobs = self._extract_logprobs(data, "input_token_logprobs")
+        new_prompt_logprobs = None
+        if new_prompt_token_ids:
+            if input_logprobs is not None and len(input_logprobs) >= len(new_prompt_token_ids):
+                new_prompt_logprobs = input_logprobs[-len(new_prompt_token_ids) :]
+            else:
+                new_prompt_logprobs = [0.0] * len(new_prompt_token_ids)
+
+        if new_prompt_token_ids:
+            self.token_manager.add_prompt(new_prompt_token_ids, new_prompt_logprobs)
+        if output_tokens:
+            self.token_manager.add_response(output_tokens, output_logprobs)
+
+        routed_experts = data.get("meta_info", {}).get("routed_experts") or []
+        if not isinstance(routed_experts, list):
+            routed_experts = []
+
+        text = data.get("text", "")
+        if not isinstance(text, str):
+            text = str(text)
+
+        parsed = self.parse_response(text)
+        self._processed_message_count = len(history) + 1
+
+        output: dict[str, Any] = {
+            "message": parsed["message"],
+            "new_prompt_token_ids": new_prompt_token_ids or [],
+            "new_prompt_logprobs": new_prompt_logprobs or [],
+            "output_tokens": output_tokens,
+            "rollout_log_probs": output_logprobs,
+            "rollout_routed_experts": routed_experts,
+        }
+        if parsed.get("tool_calls"):
+            output["tool_calls"] = parsed["tool_calls"]
+        if parsed.get("reasoning_content"):
+            output["reasoning_content"] = parsed["reasoning_content"]
+        self._update_stats(input_tokens=input_tokens, output_tokens=len(output_tokens), cost=0.0)
+        return [output]
+
+    def _query(self, history: History, n: int | None = None, temperature: float | None = None) -> list[dict]:
+        if n is None:
+            return self._single_query(history, temperature=temperature)
+        outputs: list[dict[str, Any]] = []
+        for _ in range(n):
+            outputs.extend(self._single_query(history, temperature=temperature))
+        return outputs
+
+    def query(self, history: History | list[int], n: int = 1, temperature: float | None = None) -> list[dict] | dict:
+        if not history:
+            message_history: History = []
+        elif isinstance(history[0], dict):
+            message_history = history  # type: ignore[assignment]
+        else:
+            raise TypeError("SGLangModel.query expects message history for incremental tokenization")
+
+        def retry_warning(retry_state: RetryCallState):
+            exception_info = ""
+            if retry_state.outcome is not None and retry_state.outcome.exception() is not None:
+                exception = retry_state.outcome.exception()
+                exception_info = f" due to {exception.__class__.__name__}: {exception}"
+            self.logger.warning(
+                f"Retrying LM query: attempt {retry_state.attempt_number} "
+                f"(slept for {retry_state.idle_for:.2f}s){exception_info}"
+            )
+
+        for attempt in Retrying(
+            stop=stop_after_attempt(self.config.retry.retries),
+            wait=wait_random_exponential(min=self.config.retry.min_wait, max=self.config.retry.max_wait),
+            reraise=True,
+            retry=retry_if_not_exception_type(
+                (
+                    ContextWindowExceededError,
+                    CostLimitExceededError,
+                    RuntimeError,
+                    TypeError,
+                    ContentPolicyViolationError,
+                    ModelConfigurationError,
+                    KeyboardInterrupt,
+                    IndexError,
+                    AssertionError,
+                )
+            ),
+            before_sleep=retry_warning,
+        ):
+            with attempt:
+                result = self._query(message_history, n=n, temperature=temperature)
+
+        if n is None or n == 1:
+            return result[0]
+        return result
+
+
 def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
     """Returns correct model object given arguments and commands"""
-    # Convert GenericAPIModelConfig to specific model config if needed
     if isinstance(args, GenericAPIModelConfig) and not isinstance(
-        args, HumanModelConfig | HumanThoughtModelConfig | ReplayModelConfig | InstantEmptySubmitModelConfig
+        args,
+        HumanModelConfig
+        | HumanThoughtModelConfig
+        | ReplayModelConfig
+        | InstantEmptySubmitModelConfig
+        | SGLangModelConfig,
     ):
         if args.name == "human":
             args = HumanModelConfig(**args.model_dump())
@@ -886,6 +1291,8 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
             args = ReplayModelConfig(**args.model_dump())
         elif args.name == "instant_empty_submit":
             args = InstantEmptySubmitModelConfig(**args.model_dump())
+        elif args.name == "openai/sglang":
+            args = SGLangModelConfig(**args.model_dump())
 
     if args.name == "human":
         assert isinstance(args, HumanModelConfig), f"Expected {HumanModelConfig}, got {args}"
@@ -896,8 +1303,11 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
     if args.name == "replay":
         assert isinstance(args, ReplayModelConfig), f"Expected {ReplayModelConfig}, got {args}"
         return ReplayModel(args, tools)
-    elif args.name == "instant_empty_submit":
+    if args.name == "instant_empty_submit":
         assert isinstance(args, InstantEmptySubmitModelConfig), f"Expected {InstantEmptySubmitModelConfig}, got {args}"
         return InstantEmptySubmitTestModel(args, tools)
+    if args.name == "openai/sglang" or isinstance(args, SGLangModelConfig):
+        assert isinstance(args, SGLangModelConfig), f"Expected {SGLangModelConfig}, got {args}"
+        return SGLangModel(args, tools)
     assert isinstance(args, GenericAPIModelConfig), f"Expected {GenericAPIModelConfig}, got {args}"
     return LiteLLMModel(args, tools)
