@@ -508,6 +508,74 @@ class TestSingleQuery:
 
     @patch("sweagent.agent.models.time")
     @patch("sweagent.agent.models.requests.post")
+    def test_parse_response_integration(self, mock_post, mock_time, model):
+        """_single_query without mocking parse_response: text → real parser → tool_calls."""
+        # Discover a valid tool_call_parser name from the installed sglang
+        try:
+            from sglang.srt.function_call.function_call_parser import FunctionCallParser as _FCP
+            available_parsers = list(getattr(_FCP, "_registry", {}).keys()) or ["hermes"]
+        except Exception:
+            available_parsers = ["hermes"]
+        tool_call_parser = "hermes" if "hermes" in available_parsers else available_parsers[0]
+
+        # Discover a valid reasoning_parser name
+        try:
+            from sglang.srt.parser.reasoning_parser import ReasoningParser as _RP
+            available_reasoning = list(getattr(_RP, "DetectorMap", {}).keys())
+        except Exception:
+            available_reasoning = []
+        if not available_reasoning:
+            pytest.skip("No reasoning parsers available in installed sglang")
+        reasoning_parser = available_reasoning[0]
+
+        # Reconfigure model with real parser names
+        model.tool_call_parser = tool_call_parser
+        model.reasoning_parser = reasoning_parser
+        model.tools.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Run a bash command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }
+        ]
+
+        mock_time.time.return_value = 1000.0
+        # Simulate SGLang returning hermes-format tool call text
+        tool_call_text = '<tool_call>{"name": "bash", "arguments": {"command": "ls -la"}}</tool_call>'
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = _make_sglang_response(
+            text=tool_call_text,
+            output_ids=[201, 202, 203],
+            output_logprobs=[[-0.1, 201], [-0.2, 202], [-0.3, 203]],
+        )
+        mock_resp.raise_for_status.return_value = None
+        mock_post.return_value = mock_resp
+
+        # NO mock on parse_response — real parser runs
+        history = History([{"role": "user", "content": "list files"}])
+        result = model._single_query(history)
+
+        assert len(result) == 1
+        r = result[0]
+        # Token bookkeeping should still work
+        assert r["output_tokens"] == [201, 202, 203]
+        assert len(r["rollout_log_probs"]) == 3
+        # Real parser should have extracted tool_calls
+        assert r.get("tool_calls") is not None
+        assert len(r["tool_calls"]) >= 1
+        assert r["tool_calls"][0]["function"]["name"] == "bash"
+        parsed_args = json.loads(r["tool_calls"][0]["function"]["arguments"])
+        assert parsed_args["command"] == "ls -la"
+
+    @patch("sweagent.agent.models.time")
+    @patch("sweagent.agent.models.requests.post")
     def test_non_list_output_ids_handled(self, mock_post, mock_time, model):
         mock_time.time.return_value = 1000.0
         mock_resp = MagicMock()
