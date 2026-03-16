@@ -5,14 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from sweagent.agent.agents import RLTokenAgent
+from sweagent.agent.agents import RLTokenAgent, TemplateConfig
 from sweagent.agent.history_processors import DefaultHistoryProcessor
 from sweagent.agent.models import InstanceStats
 from sweagent.agent.token_manager import TokenManager
 from sweagent.environment.swe_env import SWEEnv
 from sweagent.tools.parsing import Identity
 from sweagent.tools.tools import ToolConfig, ToolHandler
-from sweagent.types import StepOutput, TemplateConfig
+from sweagent.types import StepOutput
 
 
 # ---------------------------------------------------------------------------
