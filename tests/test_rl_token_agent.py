@@ -171,6 +171,9 @@ class TestRequireTokenizer:
 # ---------------------------------------------------------------------------
 class TestGetModelRequeryHistory:
     def test_returns_deepcopy_of_messages(self, rl_agent):
+        from sweagent.agent.problem_statement import EmptyProblemStatement
+
+        rl_agent._problem_statement = EmptyProblemStatement()
         rl_agent.history = [{"role": "user", "content": "hello"}]
         result = rl_agent.get_model_requery_history(
             error_template="Error: {{ output }}",
@@ -186,6 +189,10 @@ class TestGetModelRequeryHistory:
 # ---------------------------------------------------------------------------
 class TestAddStepToHistory:
     def test_assistant_message_includes_rollout_fields(self, rl_agent):
+        from sweagent.agent.problem_statement import EmptyProblemStatement
+
+        rl_agent._problem_statement = EmptyProblemStatement()
+
         step = StepOutput()
         step.output = "I will run ls"
         step.thought = "Let me list files"
@@ -206,6 +213,10 @@ class TestAddStepToHistory:
         assert msg["output_tokens"] == [10, 11]
 
     def test_tool_calls_included(self, rl_agent):
+        from sweagent.agent.problem_statement import EmptyProblemStatement
+
+        rl_agent._problem_statement = EmptyProblemStatement()
+
         step = StepOutput()
         step.output = "I need to run bash"
         step.thought = "Run ls"

@@ -303,14 +303,15 @@ class TestSortIncrementalHistory:
 # tokenize_prompt_messages
 # ---------------------------------------------------------------------------
 class TestTokenizePromptMessages:
-    def test_first_call_full_tokenization(self, model, mock_tokenizer):
+    def test_first_call_full_tokenization(self, model):
         history = History([{"role": "user", "content": "hello"}])
         result = model.tokenize_prompt_messages(history)
         assert result is not None
         assert result == [10, 20, 30, 40, 50]
-        mock_tokenizer.apply_chat_template.assert_called_once()
+        # config.tokenizer is a deep copy; check via model's own reference
+        model.config.tokenizer.apply_chat_template.assert_called_once()
 
-    def test_no_new_messages_returns_none(self, model, mock_tokenizer):
+    def test_no_new_messages_returns_none(self, model):
         # Simulate: token_manager is non-empty (has prior data),
         # and processed_message_count == len(history)
         model.token_manager.add_prompt([1, 2, 3])
@@ -319,12 +320,12 @@ class TestTokenizePromptMessages:
         result = model.tokenize_prompt_messages(history)
         assert result is None
 
-    def test_incremental_returns_new_tokens(self, model, mock_tokenizer):
+    def test_incremental_returns_new_tokens(self, model):
         # First call sets up state
         model.token_manager.add_prompt([1, 2, 3])
         model._processed_message_count = 1
 
-        # Configure tokenizer to return different results for full vs prefix
+        # Configure tokenizer ON THE MODEL's deep-copied config
         call_count = [0]
         def side_effect(*, conversation, tools=None, add_generation_prompt, tokenize, return_dict):
             call_count[0] += 1
@@ -335,7 +336,7 @@ class TestTokenizePromptMessages:
                 # Prefix-only tokenization
                 return [50, 51, 52]
 
-        mock_tokenizer.apply_chat_template.side_effect = side_effect
+        model.config.tokenizer.apply_chat_template.side_effect = side_effect
         history = History([
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
@@ -346,7 +347,7 @@ class TestTokenizePromptMessages:
         # Result should be full_ids[len(prefix_ids):] = [53, 54, 55]
         assert result == [53, 54, 55]
 
-    def test_incremental_with_separator(self, model, mock_tokenizer):
+    def test_incremental_with_separator(self, model):
         model.token_manager.add_prompt([1, 2, 3])
         model._processed_message_count = 1
         model.config.message_separator = "\n"
@@ -359,8 +360,8 @@ class TestTokenizePromptMessages:
             else:
                 return [50, 51]
 
-        mock_tokenizer.apply_chat_template.side_effect = side_effect
-        mock_tokenizer.encode.return_value = [99]  # separator token
+        model.config.tokenizer.apply_chat_template.side_effect = side_effect
+        model.config.tokenizer.encode.return_value = [99]  # separator token
 
         history = History([
             {"role": "user", "content": "hello"},
