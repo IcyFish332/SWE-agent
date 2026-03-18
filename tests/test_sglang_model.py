@@ -410,15 +410,14 @@ class TestValidateIncrementalTokens:
 
 
 # ---------------------------------------------------------------------------
-# _single_query (requires mocking httpx.AsyncClient and parse_response)
+# _single_query (requires mocking model._http_client and parse_response)
 # ---------------------------------------------------------------------------
 class TestSingleQuery:
-    def _make_mock_client(self, mock_resp):
-        """Create a mock httpx.AsyncClient that returns mock_resp from post()."""
+    def _setup_mock_client(self, model, mock_resp):
+        """Replace model._http_client with a mock that returns mock_resp from post()."""
         mock_client = AsyncMock()
         mock_client.post.return_value = mock_resp
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        model._http_client = mock_client
         return mock_client
 
     @pytest.mark.asyncio
@@ -428,14 +427,13 @@ class TestSingleQuery:
             input_logprobs=[[0.0, i] for i in [10, 20, 30, 40, 50]]
         )
         mock_resp.raise_for_status = MagicMock()
-        mock_client = self._make_mock_client(mock_resp)
+        self._setup_mock_client(model, mock_resp)
 
-        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
-            with patch.object(model, "_sleep", new_callable=AsyncMock):
-                with patch.object(model, "_update_stats", new_callable=AsyncMock):
-                    with patch.object(model, "parse_response", return_value={"message": "response text"}):
-                        history = History([{"role": "user", "content": "hello"}])
-                        result = await model._single_query(history)
+        with patch.object(model, "_sleep", new_callable=AsyncMock):
+            with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                with patch.object(model, "parse_response", return_value={"message": "response text"}):
+                    history = History([{"role": "user", "content": "hello"}])
+                    result = await model._single_query(history)
 
         assert len(result) == 1
         assert result[0]["message"] == "response text"
@@ -449,14 +447,13 @@ class TestSingleQuery:
             input_logprobs=[[0.0, i] for i in [10, 20, 30, 40, 50]]
         )
         mock_resp.raise_for_status = MagicMock()
-        mock_client = self._make_mock_client(mock_resp)
+        self._setup_mock_client(model, mock_resp)
 
-        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
-            with patch.object(model, "_sleep", new_callable=AsyncMock):
-                with patch.object(model, "_update_stats", new_callable=AsyncMock):
-                    with patch.object(model, "parse_response", return_value={"message": "text"}):
-                        history = History([{"role": "user", "content": "hello"}])
-                        await model._single_query(history)
+        with patch.object(model, "_sleep", new_callable=AsyncMock):
+            with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                with patch.object(model, "parse_response", return_value={"message": "text"}):
+                    history = History([{"role": "user", "content": "hello"}])
+                    await model._single_query(history)
 
         # Token manager should have prompt + response segments
         assert len(model.token_manager) > 0
@@ -468,14 +465,13 @@ class TestSingleQuery:
         mock_resp = MagicMock()
         mock_resp.json.return_value = _make_sglang_response()
         mock_resp.raise_for_status = MagicMock()
-        mock_client = self._make_mock_client(mock_resp)
+        self._setup_mock_client(model, mock_resp)
 
-        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
-            with patch.object(model, "_sleep", new_callable=AsyncMock):
-                with patch.object(model, "_update_stats", new_callable=AsyncMock):
-                    with patch.object(model, "parse_response", return_value={"message": "text"}):
-                        history = History([{"role": "user", "content": "hello"}])
-                        await model._single_query(history)
+        with patch.object(model, "_sleep", new_callable=AsyncMock):
+            with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                with patch.object(model, "parse_response", return_value={"message": "text"}):
+                    history = History([{"role": "user", "content": "hello"}])
+                    await model._single_query(history)
 
         # Should be len(history) + 1 = 2
         assert model._processed_message_count == 2
@@ -497,13 +493,12 @@ class TestSingleQuery:
             output_logprobs=[[-0.1, 101]],  # only 1 logprob for 3 tokens
         )
         mock_resp.raise_for_status = MagicMock()
-        mock_client = self._make_mock_client(mock_resp)
+        self._setup_mock_client(model, mock_resp)
 
-        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
-            with patch.object(model, "_sleep", new_callable=AsyncMock):
-                with patch.object(model, "_update_stats", new_callable=AsyncMock):
-                    with patch.object(model, "parse_response", return_value={"message": "text"}):
-                        result = await model._single_query(History([{"role": "user", "content": "hello"}]))
+        with patch.object(model, "_sleep", new_callable=AsyncMock):
+            with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                with patch.object(model, "parse_response", return_value={"message": "text"}):
+                    result = await model._single_query(History([{"role": "user", "content": "hello"}]))
 
         # Should be padded to 3
         assert len(result[0]["rollout_log_probs"]) == 3
@@ -516,13 +511,12 @@ class TestSingleQuery:
             output_logprobs=[[-0.1, 101], [-0.2, 102], [-0.3, 103]],  # 3 logprobs for 1 token
         )
         mock_resp.raise_for_status = MagicMock()
-        mock_client = self._make_mock_client(mock_resp)
+        self._setup_mock_client(model, mock_resp)
 
-        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
-            with patch.object(model, "_sleep", new_callable=AsyncMock):
-                with patch.object(model, "_update_stats", new_callable=AsyncMock):
-                    with patch.object(model, "parse_response", return_value={"message": "text"}):
-                        result = await model._single_query(History([{"role": "user", "content": "hello"}]))
+        with patch.object(model, "_sleep", new_callable=AsyncMock):
+            with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                with patch.object(model, "parse_response", return_value={"message": "text"}):
+                    result = await model._single_query(History([{"role": "user", "content": "hello"}]))
 
         assert len(result[0]["rollout_log_probs"]) == 1
 
@@ -574,14 +568,13 @@ class TestSingleQuery:
             output_logprobs=[[-0.1, 201], [-0.2, 202], [-0.3, 203]],
         )
         mock_resp.raise_for_status = MagicMock()
-        mock_client = self._make_mock_client(mock_resp)
+        self._setup_mock_client(model, mock_resp)
 
         # NO mock on parse_response -- real parser runs
-        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
-            with patch.object(model, "_sleep", new_callable=AsyncMock):
-                with patch.object(model, "_update_stats", new_callable=AsyncMock):
-                    history = History([{"role": "user", "content": "list files"}])
-                    result = await model._single_query(history)
+        with patch.object(model, "_sleep", new_callable=AsyncMock):
+            with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                history = History([{"role": "user", "content": "list files"}])
+                result = await model._single_query(history)
 
         assert len(result) == 1
         r = result[0]
@@ -602,13 +595,12 @@ class TestSingleQuery:
         data["output_ids"] = "not a list"
         mock_resp.json.return_value = data
         mock_resp.raise_for_status = MagicMock()
-        mock_client = self._make_mock_client(mock_resp)
+        self._setup_mock_client(model, mock_resp)
 
-        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
-            with patch.object(model, "_sleep", new_callable=AsyncMock):
-                with patch.object(model, "_update_stats", new_callable=AsyncMock):
-                    with patch.object(model, "parse_response", return_value={"message": "text"}):
-                        result = await model._single_query(History([{"role": "user", "content": "hello"}]))
+        with patch.object(model, "_sleep", new_callable=AsyncMock):
+            with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                with patch.object(model, "parse_response", return_value={"message": "text"}):
+                    result = await model._single_query(History([{"role": "user", "content": "hello"}]))
 
         assert result[0]["output_tokens"] == []
 

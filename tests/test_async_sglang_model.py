@@ -1,15 +1,13 @@
 """T1: Async tests for SGLangModel (hot path).
 
-These tests verify the async target API. They will FAIL on the current sync
-code and PASS after the async conversion of models.py.
-
 Covers:
-- _sleep()        : time.sleep -> asyncio.sleep
-- _update_stats() : threading.Lock -> asyncio.Lock
-- _single_query() : requests.post -> httpx.AsyncClient
-- _query() / query() : sync -> async, Retrying -> AsyncRetrying
-- GLOBAL_STATS_LOCK : threading.Lock -> asyncio.Lock
+- All async methods are coroutines (parametrized smoke test)
+- _sleep() behavior with asyncio.sleep
+- _update_stats() with asyncio.Lock
+- _single_query() with persistent httpx client
+- query() with AsyncRetrying
 - _THREADS_THAT_USED_API_KEYS removal
+- Source-level: no sync blocking patterns
 """
 from __future__ import annotations
 
@@ -59,7 +57,7 @@ def _make_sglang_response(
 
 
 # ---------------------------------------------------------------------------
-# Fixtures (mirrors test_sglang_model.py style)
+# Fixtures
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def mock_tokenizer():
@@ -89,46 +87,47 @@ def model(sglang_config):
 
 
 # ---------------------------------------------------------------------------
-# _sleep: time.sleep -> asyncio.sleep
+# Parametrized coroutine signature check
+# ---------------------------------------------------------------------------
+_ASYNC_METHODS = ["_sleep", "_update_stats", "_single_query", "_query", "query"]
+
+
+class TestMethodsAreCoroutines:
+    @pytest.mark.parametrize("method", _ASYNC_METHODS)
+    def test_is_coroutine(self, model, method):
+        assert asyncio.iscoroutinefunction(getattr(model, method)), (
+            f"SGLangModel.{method} should be async def"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _sleep behavior
 # ---------------------------------------------------------------------------
 class TestAsyncSleep:
-    """_sleep() must use asyncio.sleep instead of time.sleep."""
-
-    @pytest.mark.asyncio
-    async def test_sleep_is_coroutine(self, model):
-        assert asyncio.iscoroutinefunction(model._sleep)
-
     @pytest.mark.asyncio
     async def test_sleep_calls_asyncio_sleep(self, model):
-        model.config.delay = 10.0  # large delay to guarantee sleep branch
+        model.config.delay = 10.0
         from sweagent.agent.models import GLOBAL_STATS
 
-        GLOBAL_STATS.last_query_timestamp = time.time()  # just queried
+        GLOBAL_STATS.last_query_timestamp = time.time()
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_async_sleep:
             await model._sleep()
             mock_async_sleep.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_sleep_skips_when_elapsed_sufficient(self, model):
-        """No sleep when enough time has elapsed since last query."""
         model.config.delay = 0
-        await model._sleep()  # should complete instantly
+        await model._sleep()
 
 
 # ---------------------------------------------------------------------------
-# _update_stats: threading.Lock -> asyncio.Lock
+# _update_stats behavior
 # ---------------------------------------------------------------------------
 class TestAsyncUpdateStats:
-    @pytest.mark.asyncio
-    async def test_update_stats_is_coroutine(self, model):
-        assert asyncio.iscoroutinefunction(model._update_stats)
-
     def test_global_stats_lock_is_asyncio_lock(self):
         from sweagent.agent.models import GLOBAL_STATS_LOCK
 
-        assert isinstance(GLOBAL_STATS_LOCK, asyncio.Lock), (
-            "GLOBAL_STATS_LOCK should be asyncio.Lock, not threading.Lock"
-        )
+        assert isinstance(GLOBAL_STATS_LOCK, asyncio.Lock)
 
     @pytest.mark.asyncio
     async def test_update_stats_increments_correctly(self, model):
@@ -139,16 +138,11 @@ class TestAsyncUpdateStats:
 
 
 # ---------------------------------------------------------------------------
-# _single_query: requests.post -> httpx.AsyncClient
+# _single_query behavior
 # ---------------------------------------------------------------------------
 class TestAsyncSingleQuery:
     @pytest.mark.asyncio
-    async def test_single_query_is_coroutine(self, model):
-        assert asyncio.iscoroutinefunction(model._single_query)
-
-    @pytest.mark.asyncio
     async def test_successful_query_with_httpx(self, model):
-        """_single_query should use httpx, not requests."""
         mock_response = MagicMock()
         mock_response.json.return_value = _make_sglang_response(
             input_logprobs=[[0.0, i] for i in [10, 20, 30, 40, 50]],
@@ -156,26 +150,22 @@ class TestAsyncSingleQuery:
         mock_response.raise_for_status = MagicMock()
         mock_response.status_code = 200
 
-        mock_client = AsyncMock()
-        mock_client.post.return_value = mock_response
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        model._http_client = AsyncMock()
+        model._http_client.post.return_value = mock_response
 
-        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
-            with patch.object(model, "parse_response", return_value={"message": "response text"}):
-                with patch.object(model, "_sleep", new_callable=AsyncMock):
-                    with patch.object(model, "_update_stats", new_callable=AsyncMock):
-                        history = History([{"role": "user", "content": "hello"}])
-                        result = await model._single_query(history)
+        with patch.object(model, "parse_response", return_value={"message": "response text"}):
+            with patch.object(model, "_sleep", new_callable=AsyncMock):
+                with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                    history = History([{"role": "user", "content": "hello"}])
+                    result = await model._single_query(history)
 
         assert len(result) == 1
         assert result[0]["message"] == "response text"
         assert result[0]["output_tokens"] == [101, 102, 103]
-        mock_client.post.assert_awaited_once()
+        model._http_client.post.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_context_exceeded_before_http(self, model, mock_tokenizer):
-        """Token limit check still works under async."""
         model.model_max_input_tokens = 3
         mock_tokenizer.apply_chat_template.return_value = [1, 2, 3, 4, 5]
         with patch.object(model, "_sleep", new_callable=AsyncMock):
@@ -183,35 +173,15 @@ class TestAsyncSingleQuery:
             with pytest.raises(ContextWindowExceededError):
                 await model._single_query(history)
 
-    @pytest.mark.asyncio
-    async def test_no_requests_import_in_single_query(self):
-        """The hot-path _single_query should not use requests.post."""
-        import inspect
-
-        source = inspect.getsource(SGLangModel._single_query)
-        assert "requests.post" not in source, (
-            "_single_query should use httpx.AsyncClient, not requests.post"
-        )
-
 
 # ---------------------------------------------------------------------------
-# _query / query: sync -> async
+# query behavior
 # ---------------------------------------------------------------------------
 class TestAsyncQuery:
     @pytest.mark.asyncio
-    async def test_query_is_coroutine(self, model):
-        assert asyncio.iscoroutinefunction(model.query)
-
-    @pytest.mark.asyncio
-    async def test_query_method_is_coroutine(self, model):
-        assert asyncio.iscoroutinefunction(model._query)
-
-    @pytest.mark.asyncio
     async def test_query_n1_returns_dict(self, model):
         with patch.object(
-            model,
-            "_single_query",
-            new_callable=AsyncMock,
+            model, "_single_query", new_callable=AsyncMock,
             return_value=[{"message": "ok", "output_tokens": [1]}],
         ):
             result = await model.query(History([{"role": "user", "content": "hi"}]), n=1)
@@ -220,11 +190,6 @@ class TestAsyncQuery:
 
     @pytest.mark.asyncio
     async def test_query_uses_async_retrying(self, model):
-        """query() must use tenacity.AsyncRetrying, not sync Retrying.
-
-        If sync Retrying is used, the internal time.sleep will block the
-        event loop, which defeats the purpose of async conversion.
-        """
         call_count = 0
 
         async def mock_query(*args, **kwargs):
@@ -245,9 +210,7 @@ class TestAsyncQuery:
     @pytest.mark.asyncio
     async def test_query_n_returns_list(self, model):
         with patch.object(
-            model,
-            "_single_query",
-            new_callable=AsyncMock,
+            model, "_single_query", new_callable=AsyncMock,
             return_value=[{"message": "ok"}],
         ):
             result = await model.query(
@@ -258,46 +221,40 @@ class TestAsyncQuery:
 
 
 # ---------------------------------------------------------------------------
-# _THREADS_THAT_USED_API_KEYS removal
+# API key tracking
 # ---------------------------------------------------------------------------
 class TestApiKeyByTask:
     def test_thread_tracking_list_removed(self):
-        """_THREADS_THAT_USED_API_KEYS should be removed in favor of task-based tracking."""
         from sweagent.agent import models
 
-        assert not hasattr(models, "_THREADS_THAT_USED_API_KEYS"), (
-            "_THREADS_THAT_USED_API_KEYS should be replaced with "
-            "task-based key selection for async compatibility"
-        )
+        assert not hasattr(models, "_THREADS_THAT_USED_API_KEYS")
 
 
 # ---------------------------------------------------------------------------
-# Source-level checks: no sync blocking in async hot path
+# Source-level checks
 # ---------------------------------------------------------------------------
 class TestNoSyncBlockingInSource:
     def test_no_time_sleep_in_sleep_method(self):
         import inspect
 
         source = inspect.getsource(SGLangModel._sleep)
-        assert "time.sleep" not in source, (
-            "_sleep should use asyncio.sleep, not time.sleep"
-        )
+        assert "time.sleep" not in source
 
     def test_no_threading_lock_in_module(self):
         import inspect
         from sweagent.agent import models
 
         source = inspect.getsource(models)
-        # GLOBAL_STATS_LOCK should be asyncio.Lock, not threading.Lock
-        assert "GLOBAL_STATS_LOCK = Lock()" not in source, (
-            "GLOBAL_STATS_LOCK should be asyncio.Lock(), not threading.Lock()"
-        )
+        assert "GLOBAL_STATS_LOCK = Lock()" not in source
 
     def test_no_sync_retrying_in_query(self):
         import inspect
 
         source = inspect.getsource(SGLangModel.query)
-        assert "for attempt in Retrying(" not in source, (
-            "query() should use 'async for attempt in AsyncRetrying(', "
-            "not 'for attempt in Retrying('"
-        )
+        assert "for attempt in Retrying(" not in source
+
+    def test_no_requests_import_in_single_query(self):
+        import inspect
+
+        source = inspect.getsource(SGLangModel._single_query)
+        assert "requests.post" not in source

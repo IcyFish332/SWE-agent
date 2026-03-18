@@ -1,17 +1,10 @@
 """T2: Async tests for SWEEnv.
 
-These tests verify the async target API. They will FAIL on the current sync
-code and PASS after the async conversion of swe_env.py.
-
 Covers:
-- communicate()      (hot path, every step)
-- close()
-- _init_deployment()
-- start() / reset() / hard_reset()
-- read_file() / write_file()
-- interrupt_session()
-- execute_command()
-- set_env_variables()
+- All public methods are coroutines (parametrized smoke test)
+- communicate() hot path behavior
+- close / _init_deployment / start / reset / hard_reset behavior
+- read_file / write_file / interrupt_session / execute_command behavior
 - No asyncio.run() calls remain in source
 """
 from __future__ import annotations
@@ -66,13 +59,28 @@ def env(mock_deployment):
 
 
 # ---------------------------------------------------------------------------
+# Parametrized coroutine signature check
+# ---------------------------------------------------------------------------
+_ASYNC_METHODS = [
+    "communicate", "close", "start", "reset", "hard_reset",
+    "_init_deployment", "_copy_repo", "_reset_repository",
+    "read_file", "write_file", "set_env_variables",
+    "interrupt_session", "execute_command",
+]
+
+
+class TestMethodsAreCoroutines:
+    @pytest.mark.parametrize("method", _ASYNC_METHODS)
+    def test_is_coroutine(self, env, method):
+        assert asyncio.iscoroutinefunction(getattr(env, method)), (
+            f"SWEEnv.{method} should be async def"
+        )
+
+
+# ---------------------------------------------------------------------------
 # communicate (HOT PATH)
 # ---------------------------------------------------------------------------
 class TestAsyncCommunicate:
-    @pytest.mark.asyncio
-    async def test_communicate_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.communicate)
-
     @pytest.mark.asyncio
     async def test_communicate_awaits_runtime(self, env, mock_deployment):
         result = await env.communicate("ls")
@@ -97,27 +105,16 @@ class TestAsyncCommunicate:
 
 
 # ---------------------------------------------------------------------------
-# close
+# close / _init_deployment / start / reset / hard_reset
 # ---------------------------------------------------------------------------
 class TestAsyncClose:
-    @pytest.mark.asyncio
-    async def test_close_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.close)
-
     @pytest.mark.asyncio
     async def test_close_awaits_deployment_stop(self, env, mock_deployment):
         await env.close()
         mock_deployment.stop.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# _init_deployment
-# ---------------------------------------------------------------------------
 class TestAsyncInitDeployment:
-    @pytest.mark.asyncio
-    async def test_init_deployment_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env._init_deployment)
-
     @pytest.mark.asyncio
     async def test_init_deployment_awaits_start_and_create_session(
         self, env, mock_deployment
@@ -127,14 +124,7 @@ class TestAsyncInitDeployment:
         mock_deployment.runtime.create_session.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# start
-# ---------------------------------------------------------------------------
 class TestAsyncStart:
-    @pytest.mark.asyncio
-    async def test_start_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.start)
-
     @pytest.mark.asyncio
     async def test_start_calls_init_and_reset(self, env):
         with (
@@ -145,20 +135,7 @@ class TestAsyncStart:
             mock_init.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# reset / hard_reset
-# ---------------------------------------------------------------------------
-class TestAsyncReset:
-    @pytest.mark.asyncio
-    async def test_reset_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.reset)
-
-
 class TestAsyncHardReset:
-    @pytest.mark.asyncio
-    async def test_hard_reset_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.hard_reset)
-
     @pytest.mark.asyncio
     async def test_hard_reset_calls_close_then_start(self, env):
         with (
@@ -171,13 +148,9 @@ class TestAsyncHardReset:
 
 
 # ---------------------------------------------------------------------------
-# read_file / write_file
+# read_file / write_file / interrupt_session / execute_command
 # ---------------------------------------------------------------------------
 class TestAsyncReadFile:
-    @pytest.mark.asyncio
-    async def test_read_file_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.read_file)
-
     @pytest.mark.asyncio
     async def test_read_file_returns_content(self, env, mock_deployment):
         result = await env.read_file("/path/to/file")
@@ -187,23 +160,12 @@ class TestAsyncReadFile:
 
 class TestAsyncWriteFile:
     @pytest.mark.asyncio
-    async def test_write_file_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.write_file)
-
-    @pytest.mark.asyncio
     async def test_write_file_awaits_runtime(self, env, mock_deployment):
         await env.write_file("/path/to/file", "content")
         mock_deployment.runtime.write_file.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# interrupt_session / execute_command / set_env_variables
-# ---------------------------------------------------------------------------
 class TestAsyncInterruptSession:
-    @pytest.mark.asyncio
-    async def test_interrupt_session_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.interrupt_session)
-
     @pytest.mark.asyncio
     async def test_interrupt_session_awaits_runtime(self, env, mock_deployment):
         await env.interrupt_session()
@@ -212,19 +174,9 @@ class TestAsyncInterruptSession:
 
 class TestAsyncExecuteCommand:
     @pytest.mark.asyncio
-    async def test_execute_command_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.execute_command)
-
-    @pytest.mark.asyncio
     async def test_execute_command_awaits_runtime(self, env, mock_deployment):
         await env.execute_command("ls -la")
         mock_deployment.runtime.execute.assert_awaited_once()
-
-
-class TestAsyncSetEnvVariables:
-    @pytest.mark.asyncio
-    async def test_set_env_variables_is_coroutine(self, env):
-        assert asyncio.iscoroutinefunction(env.set_env_variables)
 
 
 # ---------------------------------------------------------------------------

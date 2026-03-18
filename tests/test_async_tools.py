@@ -1,12 +1,10 @@
 """T5: Async tests for ToolHandler (startup path).
 
-These tests verify the async target API. They will FAIL on the current sync
-code and PASS after the async conversion of tools.py.
-
 Covers:
-- _install_commands() : 2 asyncio.run() -> await (_upload_bundles, _check_available_commands)
-- install() / reset() / get_state() / _get_state() cascade
-- No asyncio.run() calls remain in _install_commands source
+- Async methods are coroutines (parametrized)
+- _install_commands() awaits _upload_bundles + _check_available_commands
+- get_state() returns dict
+- No asyncio.run() calls remain in source
 """
 from __future__ import annotations
 
@@ -44,55 +42,37 @@ def mock_async_env():
 
 
 # ---------------------------------------------------------------------------
-# _install_commands
+# Parametrized coroutine check
+# ---------------------------------------------------------------------------
+_ASYNC_METHODS = ["install", "reset", "_install_commands", "get_state", "_get_state"]
+
+
+class TestMethodsAreCoroutines:
+    @pytest.mark.parametrize("method", _ASYNC_METHODS)
+    def test_is_coroutine(self, handler, method):
+        assert asyncio.iscoroutinefunction(getattr(handler, method)), (
+            f"ToolHandler.{method} should be async def"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Behavior tests
 # ---------------------------------------------------------------------------
 class TestAsyncInstallCommands:
-    @pytest.mark.asyncio
-    async def test_install_commands_is_coroutine(self, handler):
-        assert asyncio.iscoroutinefunction(handler._install_commands)
-
     @pytest.mark.asyncio
     async def test_install_commands_awaits_upload_and_check(
         self, handler, mock_async_env
     ):
         with (
-            patch.object(
-                handler, "_upload_bundles", new_callable=AsyncMock
-            ) as mock_upload,
-            patch.object(
-                handler, "_check_available_commands", new_callable=AsyncMock
-            ) as mock_check,
+            patch.object(handler, "_upload_bundles", new_callable=AsyncMock) as mock_upload,
+            patch.object(handler, "_check_available_commands", new_callable=AsyncMock) as mock_check,
         ):
             await handler._install_commands(mock_async_env)
             mock_upload.assert_awaited()
             mock_check.assert_awaited()
 
 
-# ---------------------------------------------------------------------------
-# install / reset
-# ---------------------------------------------------------------------------
-class TestAsyncInstall:
-    @pytest.mark.asyncio
-    async def test_install_is_coroutine(self, handler):
-        assert asyncio.iscoroutinefunction(handler.install)
-
-    @pytest.mark.asyncio
-    async def test_reset_is_coroutine(self, handler):
-        assert asyncio.iscoroutinefunction(handler.reset)
-
-
-# ---------------------------------------------------------------------------
-# get_state / _get_state
-# ---------------------------------------------------------------------------
 class TestAsyncGetState:
-    @pytest.mark.asyncio
-    async def test_get_state_is_coroutine(self, handler):
-        assert asyncio.iscoroutinefunction(handler.get_state)
-
-    @pytest.mark.asyncio
-    async def test_get_state_is_coroutine_private(self, handler):
-        assert asyncio.iscoroutinefunction(handler._get_state)
-
     @pytest.mark.asyncio
     async def test_get_state_returns_dict(self, handler, mock_async_env):
         mock_async_env.read_file.return_value = '{"open_file": "/test.py"}'
@@ -104,16 +84,8 @@ class TestAsyncGetState:
 # Source-level
 # ---------------------------------------------------------------------------
 class TestNoAsyncioRunInTools:
-    def test_no_asyncio_run_in_install_commands(self):
-        source = inspect.getsource(ToolHandler._install_commands)
-        assert "asyncio.run(" not in source, (
-            "_install_commands should use await instead of asyncio.run()"
-        )
-
     def test_no_asyncio_run_in_module(self):
         from sweagent.tools import tools
 
         source = inspect.getsource(tools)
-        assert "asyncio.run(" not in source, (
-            "tools.py should use await instead of asyncio.run()"
-        )
+        assert "asyncio.run(" not in source

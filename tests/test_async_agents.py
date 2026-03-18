@@ -1,18 +1,17 @@
 """T3: Async tests for DefaultAgent, RLTokenAgent, RetryAgent.
 
-These tests verify the async target API. They will FAIL on the current sync
-code and PASS after the async conversion of agents.py.
-
 Covers:
-- setup() / run() / step() / forward() / forward_with_handling()
-- handle_action() / handle_submission()
-- attempt_autosubmission_after_error()  (removes asyncio.run at L834)
-- _get_edited_files_with_context()       (PatchFormatter pre-fetch pattern)
-- RetryAgent.step() / run() / _next_attempt()
+- All async methods are coroutines (parametrized smoke test)
+- forward() awaits model.query()
+- handle_action() awaits env.communicate()
+- attempt_autosubmission_after_error() uses await instead of asyncio.run()
+- _get_edited_files_with_context() pre-fetches files for PatchFormatter
+- No asyncio.run() calls remain in source
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import PurePosixPath
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,7 +31,6 @@ from sweagent.types import StepOutput
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def mock_async_model():
-    """Model mock with async query()."""
     model = MagicMock()
     model.token_manager = TokenManager()
     model.stats = InstanceStats()
@@ -54,7 +52,6 @@ def mock_async_model():
 
 @pytest.fixture
 def mock_async_env():
-    """Environment mock with all async methods."""
     env = MagicMock()
     env.communicate = AsyncMock(return_value="")
     env.read_file = AsyncMock(return_value="")
@@ -86,25 +83,39 @@ def rl_agent(mock_async_model, tool_handler):
 
 
 # ---------------------------------------------------------------------------
-# setup
+# Parametrized coroutine signature checks
 # ---------------------------------------------------------------------------
-class TestAsyncSetup:
-    @pytest.mark.asyncio
-    async def test_setup_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(rl_agent.setup)
+_DEFAULT_AGENT_ASYNC_METHODS = [
+    "setup", "forward", "forward_with_handling", "step", "run",
+    "handle_action", "handle_submission",
+    "attempt_autosubmission_after_error", "_get_edited_files_with_context",
+]
+
+_RETRY_AGENT_ASYNC_METHODS = ["step", "run", "_next_attempt"]
+
+
+class TestDefaultAgentMethodsAreCoroutines:
+    @pytest.mark.parametrize("method", _DEFAULT_AGENT_ASYNC_METHODS)
+    def test_is_coroutine(self, rl_agent, method):
+        assert asyncio.iscoroutinefunction(getattr(rl_agent, method)), (
+            f"RLTokenAgent.{method} should be async def"
+        )
+
+
+class TestRetryAgentMethodsAreCoroutines:
+    @pytest.mark.parametrize("method", _RETRY_AGENT_ASYNC_METHODS)
+    def test_is_coroutine(self, method):
+        assert asyncio.iscoroutinefunction(getattr(RetryAgent, method)), (
+            f"RetryAgent.{method} should be async def"
+        )
 
 
 # ---------------------------------------------------------------------------
-# forward
+# forward: awaits model.query()
 # ---------------------------------------------------------------------------
 class TestAsyncForward:
     @pytest.mark.asyncio
-    async def test_forward_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(rl_agent.forward)
-
-    @pytest.mark.asyncio
     async def test_forward_awaits_model_query(self, rl_agent, mock_async_model, mock_async_env):
-        """forward() must await model.query(), not call it synchronously."""
         from sweagent.agent.problem_statement import EmptyProblemStatement
 
         rl_agent._env = mock_async_env
@@ -118,19 +129,15 @@ class TestAsyncForward:
             try:
                 result = await rl_agent.forward(rl_agent.messages)
             except Exception:
-                pass  # may fail due to incomplete mock setup
+                pass
 
         mock_async_model.query.assert_awaited()
 
 
 # ---------------------------------------------------------------------------
-# handle_action
+# handle_action: awaits env.communicate()
 # ---------------------------------------------------------------------------
 class TestAsyncHandleAction:
-    @pytest.mark.asyncio
-    async def test_handle_action_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(rl_agent.handle_action)
-
     @pytest.mark.asyncio
     async def test_handle_action_awaits_communicate(self, rl_agent, mock_async_env):
         rl_agent._env = mock_async_env
@@ -149,41 +156,18 @@ class TestAsyncHandleAction:
                     try:
                         result = await rl_agent.handle_action(step)
                     except Exception:
-                        pass  # may fail due to incomplete mock setup
+                        pass
 
         mock_async_env.communicate.assert_awaited()
 
 
 # ---------------------------------------------------------------------------
-# handle_submission
-# ---------------------------------------------------------------------------
-class TestAsyncHandleSubmission:
-    @pytest.mark.asyncio
-    async def test_handle_submission_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(rl_agent.handle_submission)
-
-
-# ---------------------------------------------------------------------------
-# attempt_autosubmission_after_error
+# attempt_autosubmission_after_error: uses await, not asyncio.run()
 # ---------------------------------------------------------------------------
 class TestAsyncAttemptAutosubmission:
-    @pytest.mark.asyncio
-    async def test_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(
-            rl_agent.attempt_autosubmission_after_error
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_asyncio_run_in_method(self):
-        """L834 asyncio.run(self._env.deployment.is_alive(...))
-        must be replaced with await."""
-        import inspect
-
+    def test_no_asyncio_run_in_method(self):
         source = inspect.getsource(DefaultAgent.attempt_autosubmission_after_error)
-        assert "asyncio.run(" not in source, (
-            "attempt_autosubmission_after_error should use await, "
-            "not asyncio.run()"
-        )
+        assert "asyncio.run(" not in source
 
     @pytest.mark.asyncio
     async def test_awaits_is_alive(self, rl_agent, mock_async_env):
@@ -197,56 +181,22 @@ class TestAsyncAttemptAutosubmission:
         try:
             await rl_agent.attempt_autosubmission_after_error(step)
         except Exception:
-            pass  # may fail due to incomplete mock setup
+            pass
         mock_async_env.deployment.is_alive.assert_awaited()
 
 
 # ---------------------------------------------------------------------------
-# forward_with_handling
-# ---------------------------------------------------------------------------
-class TestAsyncForwardWithHandling:
-    @pytest.mark.asyncio
-    async def test_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(rl_agent.forward_with_handling)
-
-
-# ---------------------------------------------------------------------------
-# step
-# ---------------------------------------------------------------------------
-class TestAsyncStep:
-    @pytest.mark.asyncio
-    async def test_step_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(rl_agent.step)
-
-
-# ---------------------------------------------------------------------------
-# run
-# ---------------------------------------------------------------------------
-class TestAsyncRun:
-    @pytest.mark.asyncio
-    async def test_run_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(rl_agent.run)
-
-
-# ---------------------------------------------------------------------------
-# _get_edited_files_with_context (PatchFormatter lambda)
+# _get_edited_files_with_context: pre-fetches files for PatchFormatter
 # ---------------------------------------------------------------------------
 class TestAsyncGetEditedFilesWithContext:
     @pytest.mark.asyncio
-    async def test_is_coroutine(self, rl_agent):
-        assert asyncio.iscoroutinefunction(rl_agent._get_edited_files_with_context)
-
-    @pytest.mark.asyncio
     async def test_returns_dict_for_empty_patch(self, rl_agent, mock_async_env):
-        """With empty patch, should still return dict with default values."""
         rl_agent._env = mock_async_env
         result = await rl_agent._get_edited_files_with_context("")
         assert isinstance(result, dict)
 
     @pytest.mark.asyncio
     async def test_prefetches_files_for_patch_formatter(self, rl_agent, mock_async_env):
-        """After async conversion, read_file must be awaited BEFORE PatchFormatter
-        construction (pre-fetch), not passed as a sync lambda."""
         mock_async_env.repo = MagicMock()
         mock_async_env.repo.repo_name = "test-repo"
         mock_async_env.read_file.return_value = "line1\nline2\n"
@@ -261,26 +211,8 @@ class TestAsyncGetEditedFilesWithContext:
             "+line2\n"
         )
         result = await rl_agent._get_edited_files_with_context(patch_str)
-        # read_file must have been awaited (not called via sync lambda)
         mock_async_env.read_file.assert_awaited()
         assert isinstance(result, dict)
-
-
-# ---------------------------------------------------------------------------
-# RetryAgent
-# ---------------------------------------------------------------------------
-class TestAsyncRetryAgent:
-    @pytest.mark.asyncio
-    async def test_step_is_coroutine(self):
-        assert asyncio.iscoroutinefunction(RetryAgent.step)
-
-    @pytest.mark.asyncio
-    async def test_run_is_coroutine(self):
-        assert asyncio.iscoroutinefunction(RetryAgent.run)
-
-    @pytest.mark.asyncio
-    async def test_next_attempt_is_coroutine(self):
-        assert asyncio.iscoroutinefunction(RetryAgent._next_attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +220,7 @@ class TestAsyncRetryAgent:
 # ---------------------------------------------------------------------------
 class TestNoAsyncioRunInAgents:
     def test_no_asyncio_run_in_source(self):
-        import inspect
         from sweagent.agent import agents
 
         source = inspect.getsource(agents)
-        assert "asyncio.run(" not in source, (
-            "agents.py should use await instead of asyncio.run()"
-        )
+        assert "asyncio.run(" not in source

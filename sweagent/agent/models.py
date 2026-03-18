@@ -904,6 +904,9 @@ class SGLangModel(AbstractModel):
         )
         self.token_manager = TokenManager()
         self._processed_message_count = 0
+        self._http_client = httpx.AsyncClient(
+            timeout=self.config.completion_kwargs.get("timeout", 1800),
+        )
 
     @property
     def instance_cost_limit(self) -> float:
@@ -1160,13 +1163,11 @@ class SGLangModel(AbstractModel):
         api_key = self.config.choose_api_key()
         headers = self._build_headers(api_key)
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self.config.api_base}/generate",
-                    json=payload,
-                    headers=headers,
-                    timeout=self.config.completion_kwargs.get("timeout", 1800),
-                )
+            response = await self._http_client.post(
+                f"{self.config.api_base}/generate",
+                json=payload,
+                headers=headers,
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             self._raise_for_http_error(error)
