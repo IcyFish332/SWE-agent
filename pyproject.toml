@@ -61,6 +61,7 @@ dependencies = [
     "tabulate",
     "textual>=1.0.0",
     "requests",
+    "httpx",
 ]
 
 [project.scripts]
@@ -78,6 +79,7 @@ dev = [
     "pipx",
     "pre-commit",
     "pytest-xdist",
+    "pytest-asyncio",
     "griffe-pydantic!=1.1.3",
 ]
 

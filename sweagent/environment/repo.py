@@ -1,4 +1,3 @@
-import asyncio
 import os
 import shlex
 from pathlib import Path
@@ -23,7 +22,7 @@ class Repo(Protocol):
     base_commit: str
     repo_name: str
 
-    def copy(self, deployment: AbstractDeployment): ...
+    async def copy(self, deployment: AbstractDeployment): ...
 
     def get_reset_commands(self) -> list[str]: ...
 
@@ -63,7 +62,7 @@ class PreExistingRepoConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    def copy(self, deployment: AbstractDeployment):
+    async def copy(self, deployment: AbstractDeployment):
         """Does nothing."""
         pass
 
@@ -106,14 +105,10 @@ class LocalRepoConfig(BaseModel):
             raise ValueError(msg)
         return self
 
-    def copy(self, deployment: AbstractDeployment):
+    async def copy(self, deployment: AbstractDeployment):
         self.check_valid_repo()
-        asyncio.run(
-            deployment.runtime.upload(UploadRequest(source_path=str(self.path), target_path=f"/{self.repo_name}"))
-        )
-        r = asyncio.run(
-            deployment.runtime.execute(Command(command=f"chown -R root:root /{self.repo_name}", shell=True))
-        )
+        await deployment.runtime.upload(UploadRequest(source_path=str(self.path), target_path=f"/{self.repo_name}"))
+        r = await deployment.runtime.execute(Command(command=f"chown -R root:root /{self.repo_name}", shell=True))
         if r.exit_code != 0:
             msg = f"Failed to change permissions on copied repository (exit code: {r.exit_code}, stdout: {r.stdout}, stderr: {r.stderr})"
             raise RuntimeError(msg)
@@ -160,30 +155,28 @@ class GithubRepoConfig(BaseModel):
         _, _, url_no_protocol = self.github_url.partition("://")
         return f"https://{token}@{url_no_protocol}"
 
-    def copy(self, deployment: AbstractDeployment):
+    async def copy(self, deployment: AbstractDeployment):
         """Clones the repository to the sandbox."""
         base_commit = self.base_commit
         github_token = os.getenv("GITHUB_TOKEN", "")
         url = self._get_url_with_token(github_token)
-        asyncio.run(
-            deployment.runtime.execute(
-                Command(
-                    command=" && ".join(
-                        (
-                            f"mkdir /{self.repo_name}",
-                            f"cd /{self.repo_name}",
-                            "git init",
-                            f"git remote add origin {shlex.quote(url)}",
-                            f"git fetch --depth 1 origin {shlex.quote(base_commit)}",
-                            "git checkout FETCH_HEAD",
-                            "cd ..",
-                        )
-                    ),
-                    timeout=self.clone_timeout,
-                    shell=True,
-                    check=True,
-                )
-            ),
+        await deployment.runtime.execute(
+            Command(
+                command=" && ".join(
+                    (
+                        f"mkdir /{self.repo_name}",
+                        f"cd /{self.repo_name}",
+                        "git init",
+                        f"git remote add origin {shlex.quote(url)}",
+                        f"git fetch --depth 1 origin {shlex.quote(base_commit)}",
+                        "git checkout FETCH_HEAD",
+                        "cd ..",
+                    )
+                ),
+                timeout=self.clone_timeout,
+                shell=True,
+                check=True,
+            )
         )
 
     def get_reset_commands(self) -> list[str]:
@@ -206,7 +199,7 @@ class SWESmithRepoConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    def copy(self, deployment: AbstractDeployment):
+    async def copy(self, deployment: AbstractDeployment):
         pass
 
     @staticmethod

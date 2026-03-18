@@ -16,7 +16,7 @@ from simple_parsing.helpers.fields import field
 from swerex.exceptions import BashIncorrectSyntaxError, CommandTimeoutError, SwerexException
 from tenacity import RetryError
 from typing_extensions import Self
-from unidiff import UnidiffParseError
+from unidiff import PatchSet, UnidiffParseError
 
 from sweagent import __version__, get_agent_commit_hash, get_rex_commit_hash, get_rex_version
 from sweagent.agent.action_sampler import AbstractActionSampler, ActionSamplerConfig
@@ -237,9 +237,9 @@ class AbstractAgent:
 
     def get_trajectory_data(self) -> dict[str, Any]: ...
 
-    def step(self) -> StepOutput: ...
+    async def step(self) -> StepOutput: ...
 
-    def run(self, *args, **kwargs) -> AgentRunResult: ...
+    async def run(self, *args, **kwargs) -> AgentRunResult: ...
 
 
 def get_agent_from_config(config: AgentConfig) -> AbstractAgent:
@@ -303,7 +303,7 @@ class RetryAgent(AbstractAgent):
         self._output_dir = output_dir
         self._rloop = get_retry_loop_from_config(self.config.retry_loop, problem_statement=problem_statement)
 
-    def _setup_agent(self) -> AbstractAgent:
+    async def _setup_agent(self) -> AbstractAgent:
         """Setup the agent for the current attempt."""
         # todo: Could select "best" agent config based on previous attempts if I run > number of set up configs
         agent_config = self.config.agent_configs[self._i_attempt % len(self.config.agent_configs)].model_copy(deep=True)
@@ -318,17 +318,17 @@ class RetryAgent(AbstractAgent):
         sub_agent_output_dir = self._output_dir / f"attempt_{self._i_attempt}"
         assert self._problem_statement is not None
         assert self._env is not None
-        self._agent.setup(env=self._env, problem_statement=self._problem_statement, output_dir=sub_agent_output_dir)
+        await self._agent.setup(env=self._env, problem_statement=self._problem_statement, output_dir=sub_agent_output_dir)
         return self._agent
 
-    def _next_attempt(self) -> None:
+    async def _next_attempt(self) -> None:
         """Prepare for the next attempt: Reset the environment and setup the next agent."""
         assert self._env is not None
         self._i_attempt += 1
-        self._env.hard_reset()
-        self._setup_agent()
+        await self._env.hard_reset()
+        await self._setup_agent()
 
-    def step(self) -> StepOutput:
+    async def step(self) -> StepOutput:
         """Step the agent of the current attempt.
         Attempt autosubmit if an error occurs (though all errors should already be handled by the attempt agent).
         """
@@ -339,16 +339,16 @@ class RetryAgent(AbstractAgent):
         if self._total_instance_stats.instance_cost > 1.1 * self.config.retry_loop.cost_limit > 0:
             msg = "Total instance cost exceeded cost limit. This should not happen, please report this. Triggering autosubmit."
             self.logger.critical(msg)
-            return self._agent.attempt_autosubmission_after_error(step=StepOutput())
+            return await self._agent.attempt_autosubmission_after_error(step=StepOutput())
         try:
-            step = self._agent.step()
+            step = await self._agent.step()
         except TotalCostLimitExceededError:
             # Need to make sure that this error causes everything to stop
             raise
         except Exception as e:
             msg = "Error in agent step: %s. This really shouldn't happen, please report this. Triggering autosubmit."
             self.logger.critical(msg, e, exc_info=True)
-            step = self._agent.attempt_autosubmission_after_error(step=StepOutput())
+            step = await self._agent.attempt_autosubmission_after_error(step=StepOutput())
         return step
 
     def _finalize_agent_run(self) -> None:
@@ -390,7 +390,7 @@ class RetryAgent(AbstractAgent):
         assert self._traj_path is not None
         self._traj_path.write_text(json.dumps(data, indent=2))
 
-    def run(
+    async def run(
         self,
         env: SWEEnv,
         problem_statement: ProblemStatement | ProblemStatementConfig,
@@ -411,10 +411,10 @@ class RetryAgent(AbstractAgent):
         # Run action/observation loop
         self._chook.on_run_start()
         step_output = StepOutput()
-        self._setup_agent()
+        await self._setup_agent()
         assert self._agent is not None
         while not step_output.done:
-            step_output = self.step()
+            step_output = await self.step()
             self.save_trajectory(choose=False)
             if step_output.done:
                 self._rloop.on_submit(
@@ -430,7 +430,7 @@ class RetryAgent(AbstractAgent):
                 self.save_trajectory(choose=False)
                 if self._rloop.retry():
                     assert self._env is not None
-                    self._next_attempt()
+                    await self._next_attempt()
                     step_output.done = False
         self.save_trajectory(choose=True)  # call again after we finalized
         self._chook.on_run_done(trajectory=self._agent.trajectory, info=self._agent.info)
@@ -561,7 +561,7 @@ class DefaultAgent(AbstractAgent):
         self._chook.on_query_message_added(**item)
         self.history.append(item)  # type: ignore
 
-    def setup(
+    async def setup(
         self,
         env: SWEEnv,
         problem_statement: ProblemStatement | ProblemStatementConfig,
@@ -593,7 +593,7 @@ class DefaultAgent(AbstractAgent):
         self.logger.info("Trajectory will be saved to %s", self.traj_path)
 
         self._chook.on_tools_installation_started()
-        self.tools.install(self._env)
+        await self.tools.install(self._env)
         self._chook.on_setup_attempt()
         self.info = AgentInfo()
         self.info["swe_agent_hash"] = get_agent_commit_hash()
@@ -602,10 +602,10 @@ class DefaultAgent(AbstractAgent):
         self.info["swe_rex_hash"] = get_rex_commit_hash()
         assert self._env is not None
         assert self._problem_statement is not None
-        self._env.set_env_variables({"PROBLEM_STATEMENT": self._problem_statement.get_problem_statement_for_env()})
+        await self._env.set_env_variables({"PROBLEM_STATEMENT": self._problem_statement.get_problem_statement_for_env()})
         self.add_system_message_to_history()
         self.add_demonstrations_to_history()
-        self.add_instance_template_to_history(state=self.tools.get_state(self._env))
+        self.add_instance_template_to_history(state=await self.tools.get_state(self._env))
         self._chook.on_setup_done()
 
     def add_system_message_to_history(self) -> None:
@@ -823,7 +823,7 @@ class DefaultAgent(AbstractAgent):
             {"role": "user", "content": error_template, "agent": self.name, "message_type": "user"},
         ]
 
-    def attempt_autosubmission_after_error(self, step: StepOutput) -> StepOutput:
+    async def attempt_autosubmission_after_error(self, step: StepOutput) -> StepOutput:
         """For most exceptions, we attempt to still extract the patch and submit that.
         This means we send the `submit` command to the runtime and parse the output.
         """
@@ -831,7 +831,7 @@ class DefaultAgent(AbstractAgent):
         step = step.model_copy(deep=True)
         step.done = True
         assert self._env is not None
-        if not asyncio.run(self._env.deployment.is_alive(timeout=10)):
+        if not await self._env.deployment.is_alive(timeout=10):
             # The agent is dead. This is very bad. Maybe we can take a 'diff' that was saved
             # for a previous step? (if running with diff in tools)
             self.logger.error("Runtime is no longer alive")
@@ -859,18 +859,18 @@ class DefaultAgent(AbstractAgent):
         submission_command = "git add -A && git diff --cached > /root/model.patch"
         self.logger.info("Executing submission command %s in %s", submission_command, repo_name)
         try:
-            self._env.execute_command(submission_command, check=True, cwd=repo_name)
+            await self._env.execute_command(submission_command, check=True, cwd=repo_name)
         except Exception as e:
             self.logger.error("Failed to execute submission command, got %s", e)
         # There's still hope for the submission, because the `/root/model.patch` file might have been
         # generated by the state command
-        step = self.handle_submission(step, observation="", force_submission=True)
+        step = await self.handle_submission(step, observation="", force_submission=True)
         if step.submission:
             self.logger.info("Exiting with autosubmission")
             step.observation = "Exited (autosubmitted)"
         return step
 
-    def handle_submission(self, step: StepOutput, *, observation="", force_submission: bool = False) -> StepOutput:
+    async def handle_submission(self, step: StepOutput, *, observation="", force_submission: bool = False) -> StepOutput:
         """Check if there was a submission in the observation and handle it.
 
         Args:
@@ -887,7 +887,7 @@ class DefaultAgent(AbstractAgent):
         if is_submission or force_submission:
             assert self._env is not None
             try:
-                submission = self._env.read_file("/root/model.patch", encoding="utf-8", errors="backslashreplace")
+                submission = await self._env.read_file("/root/model.patch", encoding="utf-8", errors="backslashreplace")
             except FileNotFoundError:
                 self.logger.warning("Submission file not found, no submission was made")
                 return step
@@ -907,23 +907,28 @@ class DefaultAgent(AbstractAgent):
             self.logger.info(f"Found submission: {submission}")
         return step
 
-    def _get_edited_files_with_context(self, patch: str) -> dict[str, str]:
+    async def _get_edited_files_with_context(self, patch: str) -> dict[str, str]:
         """Get the edited files with context from the patch"""
         assert self._env is not None
         try:
             if self._env.repo is None:
                 pf = None
-            else:
-                pf = (
-                    PatchFormatter(
-                        patch,
-                        read_method=lambda path: self._env.read_file(  # type: ignore[attr-defined]
-                            PurePosixPath("/") / self._env.repo.repo_name / path  # type: ignore[attr-defined]
-                        ),
-                    )
-                    if patch
-                    else None
+            elif patch:
+                # Pre-fetch all modified files since read_file is now async.
+                # PatchFormatter calls read_method synchronously in its constructor,
+                # so we must provide a sync lambda backed by pre-fetched data.
+                parsed_patch = PatchSet(patch)
+                prefetched: dict[str, str] = {}
+                for p in parsed_patch:
+                    if p.is_modified_file:
+                        file_path = PurePosixPath("/") / self._env.repo.repo_name / p.path
+                        prefetched[p.path] = await self._env.read_file(file_path)
+                pf = PatchFormatter(
+                    patch,
+                    read_method=lambda path: prefetched.get(path, ""),
                 )
+            else:
+                pf = None
         except UnidiffParseError:
             self.logger.error("Failed to parse patch with unidiff. Some variables will be empty.")
             pf = None
@@ -936,7 +941,7 @@ class DefaultAgent(AbstractAgent):
             out[f"edited_files{context_length}"] = value
         return out
 
-    def handle_action(self, step: StepOutput) -> StepOutput:
+    async def handle_action(self, step: StepOutput) -> StepOutput:
         """Runs an action proposed by the agent in the environment and returns the corresponding output.
 
         Args:
@@ -955,7 +960,7 @@ class DefaultAgent(AbstractAgent):
             step.observation = "Exited"
             step.exit_status = "exit_command"
             assert self._env is not None
-            step.state = self.tools.get_state(env=self._env)  # for history
+            step.state = await self.tools.get_state(env=self._env)  # for history
             return step
 
         assert self._env is not None
@@ -963,7 +968,7 @@ class DefaultAgent(AbstractAgent):
         execution_t0 = time.perf_counter()
         run_action: str = self.tools.guard_multiline_input(step.action).strip()
         try:
-            step.observation = self._env.communicate(
+            step.observation = await self._env.communicate(
                 input=run_action,
                 timeout=self.tools.config.execution_timeout,
                 check="raise" if self._always_require_zero_exit_code else "ignore",
@@ -977,7 +982,7 @@ class DefaultAgent(AbstractAgent):
                 self._total_execution_time += step.execution_time
                 raise
             try:
-                self._env.interrupt_session()
+                await self._env.interrupt_session()
             except Exception as f:
                 self.logger.exception("Failed to interrupt session after command timeout: %s", f, exc_info=True)
                 step.execution_time = time.perf_counter() - execution_t0
@@ -993,7 +998,7 @@ class DefaultAgent(AbstractAgent):
         step.execution_time = time.perf_counter() - execution_t0
         self._total_execution_time += step.execution_time
         self._chook.on_action_executed(step=step)
-        step.state = self.tools.get_state(env=self._env)
+        step.state = await self.tools.get_state(env=self._env)
 
         if RETRY_WITH_OUTPUT_TOKEN in step.observation:
             step.observation = step.observation.replace(RETRY_WITH_OUTPUT_TOKEN, "")
@@ -1004,9 +1009,9 @@ class DefaultAgent(AbstractAgent):
         elif EXIT_FORFEIT_TOKEN in step.observation:
             raise _ExitForfeit()
 
-        return self.handle_submission(step)
+        return await self.handle_submission(step)
 
-    def forward(self, history: list[dict[str, str]]) -> StepOutput:
+    async def forward(self, history: list[dict[str, str]]) -> StepOutput:
         """Forward the model without handling errors.
 
         All exceptions raised will contain the `StepOutput` object
@@ -1042,7 +1047,7 @@ class DefaultAgent(AbstractAgent):
                 # todo: Handle history and trajectory
                 step.extra_info.update(best.extra_info)
             else:
-                output = self.model.query(history)  # type: ignore
+                output = await self.model.query(history)  # type: ignore
             step.output = output["message"]
             # todo: Can't I override the parser in __init__?
             step.thought, step.action = self.tools.parse_actions(output)
@@ -1052,7 +1057,7 @@ class DefaultAgent(AbstractAgent):
                 step.tool_calls = output["tool_calls"]
             self.logger.info(f"💭 THOUGHT\n{step.thought}\n\n🎬 ACTION\n{step.action.strip()}")
             self._chook.on_actions_generated(step=step)
-            return self.handle_action(step)
+            return await self.handle_action(step)
         except Exception as e:
             if step.action == step.thought == "":
                 # Probably the parsing failed/no action included. Let's still fill in thought
@@ -1062,7 +1067,7 @@ class DefaultAgent(AbstractAgent):
             e.step = step  # type: ignore
             raise
 
-    def forward_with_handling(self, history: list[dict[str, str]]) -> StepOutput:
+    async def forward_with_handling(self, history: list[dict[str, str]]) -> StepOutput:
         """Forward the model and handle errors, requerying the model if we can.
         For example, if the model outputs a bash command that has syntax errors,
         we will not execute it but requery the model for a corrected command.
@@ -1076,10 +1081,10 @@ class DefaultAgent(AbstractAgent):
             step_output: step output
         """
 
-        def handle_error_with_autosubmission(exit_status: str, message: str) -> StepOutput:
+        async def handle_error_with_autosubmission(exit_status: str, message: str) -> StepOutput:
             """Attempts to autosubmit (extract patch from the environment) and stops the loop."""
             self.logger.warning(message)
-            return self.attempt_autosubmission_after_error(
+            return await self.attempt_autosubmission_after_error(
                 StepOutput(
                     thought=message,
                     exit_status=exit_status,
@@ -1109,7 +1114,7 @@ class DefaultAgent(AbstractAgent):
         n_format_fails = 0
         while n_format_fails < self.max_requeries:
             try:
-                return self.forward(history)
+                return await self.forward(history)
 
             # Errors that are raised
 
@@ -1156,58 +1161,58 @@ class DefaultAgent(AbstractAgent):
 
             except _ExitForfeit:
                 self.logger.info("Exiting due to forfeit")
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_forfeit",
                     "Exiting due to forfeit",
                 )
 
             except _TotalExecutionTimeExceeded:
                 self.logger.exception("Exiting due to total execution time exceeded", exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_total_execution_time",
                     "Exit due to total execution time exceeded",
                 )
 
             except CommandTimeoutError:
                 self.logger.exception("Exiting due to multiple consecutive command timeouts", exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_command_timeout",
                     "Exit due to multiple consecutive command timeouts",
                 )
 
             except ContextWindowExceededError:
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_context",
                     "Exit due to context window",
                 )
             except TotalCostLimitExceededError:
                 raise
             except CostLimitExceededError:
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_cost",
                     "Exit due to cost limit",
                 )
             except RetryError as e:
                 self.logger.exception(f"Exiting due to retry error: {e}", exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_api",
                     f"Exit due to retry error: {e}",
                 )
             except SwerexException as e:
                 self.logger.exception(f"Exiting due to environment error: {e}", exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_environment_error",
                     f"Exit due to environment error: {e}",
                 )
             except RuntimeError as e:
                 self.logger.exception(f"Exiting due to runtime error: {e}", exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_error",
                     f"Exit due to runtime error: {e}",
                 )
             except Exception as e:
                 self.logger.exception(f"Exiting due to unknown error: {e}", exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     "exit_error",
                     f"Exit due to unknown error: {e}",
                 )
@@ -1215,7 +1220,7 @@ class DefaultAgent(AbstractAgent):
             "Exit due to repeated format/blocklist/bash syntax errors",
             exc_info=True,
         )
-        return handle_error_with_autosubmission(
+        return await handle_error_with_autosubmission(
             "exit_format",
             "Exit due to repeated format/blocklist/bash syntax errors",
         )
@@ -1235,7 +1240,7 @@ class DefaultAgent(AbstractAgent):
         )
         self.trajectory.append(trajectory_step)
 
-    def step(self) -> StepOutput:
+    async def step(self) -> StepOutput:
         """Run a step of the agent. This is a wrapper around `self.forward_with_handling`
         with additional bookkeeping:
 
@@ -1252,12 +1257,12 @@ class DefaultAgent(AbstractAgent):
 
         n_step = len(self.trajectory) + 1
         self.logger.info("=" * 25 + f" STEP {n_step} " + "=" * 25)
-        step_output = self.forward_with_handling(self.messages)
+        step_output = await self.forward_with_handling(self.messages)
         self.add_step_to_history(step_output)
 
         self.info["submission"] = step_output.submission
         self.info["exit_status"] = step_output.exit_status  # type: ignore
-        self.info.update(self._get_edited_files_with_context(patch=step_output.submission or ""))  # type: ignore
+        self.info.update(await self._get_edited_files_with_context(patch=step_output.submission or ""))  # type: ignore
         self.info["model_stats"] = self.model.stats.model_dump()
 
         self.add_step_to_trajectory(step_output)
@@ -1265,7 +1270,7 @@ class DefaultAgent(AbstractAgent):
         self._chook.on_step_done(step=step_output, info=self.info)
         return step_output
 
-    def run(
+    async def run(
         self,
         env: SWEEnv,
         problem_statement: ProblemStatement | ProblemStatementConfig,
@@ -1279,13 +1284,13 @@ class DefaultAgent(AbstractAgent):
             env: The environment to run the agent on.
             traj_dir: Directory to save the trajectory to
         """
-        self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
+        await self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
 
         # Run action/observation loop
         self._chook.on_run_start()
         step_output = StepOutput()
         while not step_output.done:
-            step_output = self.step()
+            step_output = await self.step()
             self.save_trajectory()
         self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
 
@@ -1351,7 +1356,7 @@ class RLTokenAgent(DefaultAgent):
         self.history.append(item)  # type: ignore[arg-type]
 
 
-    def setup(
+    async def setup(
         self,
         env: SWEEnv,
         problem_statement: ProblemStatement | ProblemStatementConfig,
@@ -1365,7 +1370,7 @@ class RLTokenAgent(DefaultAgent):
         self.rollout_routed_experts = []
         self._error_logs = []
 
-        super().setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
+        await super().setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
 
     def add_step_to_history(self, step: StepOutput) -> None:
         content = step.output if not step.tool_calls else (step.thought or step.output)
@@ -1413,7 +1418,7 @@ class RLTokenAgent(DefaultAgent):
         self.logger.warning(f"{error_template}")
         return copy.deepcopy(self.messages)
 
-    def forward(self, history: list[dict[str, Any]]) -> StepOutput:
+    async def forward(self, history: list[dict[str, Any]]) -> StepOutput:
         if self._total_execution_time > self.tools.config.total_execution_timeout:
             raise _TotalExecutionTimeExceeded()
 
@@ -1431,7 +1436,7 @@ class RLTokenAgent(DefaultAgent):
                 output = best.completion
                 step.extra_info.update(best.extra_info)
             else:
-                output = self.model.query(history)  # type: ignore[arg-type]
+                output = await self.model.query(history)  # type: ignore[arg-type]
             step.output = output["message"]
             if not self.init_input_ids:
                 new_prompt_token_ids = output.get("new_prompt_token_ids", []) or []
@@ -1447,15 +1452,15 @@ class RLTokenAgent(DefaultAgent):
                 step.tool_call_ids = [call["id"] for call in output["tool_calls"]]
                 step.tool_calls = output["tool_calls"]
             self._chook.on_actions_generated(step=step)
-            return self.handle_action(step)
+            return await self.handle_action(step)
         except Exception as error:
             if step.action == step.thought == "":
                 step.thought = step.output
             error.step = step  # type: ignore[attr-defined]
             raise
 
-    def forward_with_handling(self, history: list[dict[str, Any]]) -> StepOutput:
-        def handle_error_with_autosubmission(exception: Exception, exit_status: str, message: str) -> StepOutput:
+    async def forward_with_handling(self, history: list[dict[str, Any]]) -> StepOutput:
+        async def handle_error_with_autosubmission(exception: Exception, exit_status: str, message: str) -> StepOutput:
             full_traceback = traceback.format_exc()
             current_step = len(self.trajectory) + 1
             self._error_logs.append(
@@ -1474,7 +1479,7 @@ class RLTokenAgent(DefaultAgent):
             step.exit_status = exit_status
             step.output = message
             step.done = True
-            return self.attempt_autosubmission_after_error(step)
+            return await self.attempt_autosubmission_after_error(step)
 
         def handle_error_with_retry(exception: Exception, template: str, n_requeries: int) -> list[dict[str, Any]]:
             full_traceback = traceback.format_exc()
@@ -1509,7 +1514,7 @@ class RLTokenAgent(DefaultAgent):
         n_format_fails = 0
         while n_format_fails < self.max_requeries:
             try:
-                return self.forward(history)
+                return await self.forward(history)
             except KeyboardInterrupt:
                 raise
             except EOFError:
@@ -1541,48 +1546,48 @@ class RLTokenAgent(DefaultAgent):
                 self.logger.warning("Retry without output, trying to resample")
                 n_format_fails += 1
             except _ExitForfeit as error:
-                return handle_error_with_autosubmission(error, "exit_forfeit", "Exiting due to forfeit")
+                return await handle_error_with_autosubmission(error, "exit_forfeit", "Exiting due to forfeit")
             except _TotalExecutionTimeExceeded as error:
                 self.logger.exception("Exiting due to total execution time exceeded", exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     error, "exit_total_execution_time", "Exit due to total execution time exceeded"
                 )
             except CommandTimeoutError as error:
                 self.logger.exception("Exiting due to multiple consecutive command timeouts", exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     error, "exit_command_timeout", "Exit due to multiple consecutive command timeouts"
                 )
             except ContextWindowExceededError as error:
-                return handle_error_with_autosubmission(error, "exit_context", "Exit due to context window")
+                return await handle_error_with_autosubmission(error, "exit_context", "Exit due to context window")
             except InstanceCallLimitExceededError as error:
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     error, "exit_max_iter_out", "Exit due to max iteration out of limit"
                 )
             except TotalCostLimitExceededError:
                 raise
             except CostLimitExceededError as error:
-                return handle_error_with_autosubmission(error, "exit_cost", "Exit due to cost limit")
+                return await handle_error_with_autosubmission(error, "exit_cost", "Exit due to cost limit")
             except RetryError as error:
                 self.logger.exception("Exiting due to retry error: %s", error, exc_info=True)
-                return handle_error_with_autosubmission(error, "exit_api", f"Exit due to retry error: {error}")
+                return await handle_error_with_autosubmission(error, "exit_api", f"Exit due to retry error: {error}")
             except SwerexException as error:
                 self.logger.exception("Exiting due to environment error: %s", error, exc_info=True)
-                return handle_error_with_autosubmission(
+                return await handle_error_with_autosubmission(
                     error, "exit_environment_error", f"Exit due to environment error: {error}"
                 )
             except RuntimeError as error:
                 self.logger.exception("Exiting due to runtime error: %s", error, exc_info=True)
-                return handle_error_with_autosubmission(error, "exit_error", f"Exit due to runtime error: {error}")
+                return await handle_error_with_autosubmission(error, "exit_error", f"Exit due to runtime error: {error}")
             except Exception as error:
                 self.logger.exception("Exiting due to unknown error: %s", error, exc_info=True)
-                return handle_error_with_autosubmission(error, "exit_error", f"Exit due to unknown error: {error}")
+                return await handle_error_with_autosubmission(error, "exit_error", f"Exit due to unknown error: {error}")
 
         self.logger.exception("Exit due to repeated format/blocklist/bash syntax errors", exc_info=True)
         exception_to_use = last_requery_exception
         if exception_to_use is None:
             exception_to_use = RuntimeError("Exit due to repeated format/blocklist/bash syntax errors")
             exception_to_use.step = StepOutput()  # type: ignore[attr-defined]
-        return handle_error_with_autosubmission(
+        return await handle_error_with_autosubmission(
             exception_to_use,
             "exit_format",
             "Exit due to repeated format/blocklist/bash syntax errors",
@@ -1607,18 +1612,18 @@ class RLTokenAgent(DefaultAgent):
         )
         self.trajectory.append(trajectory_step)
 
-    def step(self) -> StepOutput:
+    async def step(self) -> StepOutput:
         assert self._env is not None
         self._chook.on_step_start()
 
         n_step = len(self.trajectory) + 1
         self.logger.info("=" * 25 + f" STEP {n_step} " + "=" * 25)
-        step_output = self.forward_with_handling(self.messages)
+        step_output = await self.forward_with_handling(self.messages)
         self.add_step_to_history(step_output)
 
         self.info["submission"] = step_output.submission
         self.info["exit_status"] = step_output.exit_status  # type: ignore[index]
-        self.info.update(self._get_edited_files_with_context(patch=step_output.submission or ""))  # type: ignore[arg-type]
+        self.info.update(await self._get_edited_files_with_context(patch=step_output.submission or ""))  # type: ignore[arg-type]
         self.info["model_stats"] = self.model.stats.model_dump()
 
         self.add_step_to_trajectory(step_output)
@@ -1626,18 +1631,18 @@ class RLTokenAgent(DefaultAgent):
         self._chook.on_step_done(step=step_output, info=self.info)
         return step_output
 
-    def run(
+    async def run(
         self,
         env: SWEEnv,
         problem_statement: ProblemStatement | ProblemStatementConfig,
         output_dir: Path = Path("."),
     ) -> AgentRunResult:
-        self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
+        await self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
 
         self._chook.on_run_start()
         step_output = StepOutput()
         while not step_output.done:
-            step_output = self.step()
+            step_output = await self.step()
             self.save_trajectory()
         self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
 

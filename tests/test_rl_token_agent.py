@@ -109,26 +109,29 @@ class TestPropertyDelegation:
 # Setup
 # ---------------------------------------------------------------------------
 class TestSetup:
-    def test_calls_reset_rollout_state(self, rl_agent, mock_model, dummy_env):
+    @pytest.mark.asyncio
+    async def test_calls_reset_rollout_state(self, rl_agent, mock_model, dummy_env):
         from sweagent.agent.problem_statement import EmptyProblemStatement
 
-        rl_agent.setup(dummy_env, EmptyProblemStatement())
+        await rl_agent.setup(dummy_env, EmptyProblemStatement())
         mock_model.reset_rollout_state.assert_called_once()
 
-    def test_clears_state_lists(self, rl_agent, mock_model, dummy_env):
+    @pytest.mark.asyncio
+    async def test_clears_state_lists(self, rl_agent, mock_model, dummy_env):
         from sweagent.agent.problem_statement import EmptyProblemStatement
 
         rl_agent.init_input_ids = [1, 2, 3]
         rl_agent.rollout_routed_experts = [[1], [2]]
         rl_agent._error_logs = [{"error": "test"}]
 
-        rl_agent.setup(dummy_env, EmptyProblemStatement())
+        await rl_agent.setup(dummy_env, EmptyProblemStatement())
 
         assert rl_agent.init_input_ids == []
         assert rl_agent.rollout_routed_experts == []
         assert rl_agent._error_logs == []
 
-    def test_rebinds_token_manager_from_model(self, mock_model, tool_handler, dummy_env):
+    @pytest.mark.asyncio
+    async def test_rebinds_token_manager_from_model(self, mock_model, tool_handler, dummy_env):
         from sweagent.agent.problem_statement import EmptyProblemStatement
 
         agent = RLTokenAgent(
@@ -141,7 +144,7 @@ class TestSetup:
         new_tm = TokenManager()
         mock_model.token_manager = new_tm
 
-        agent.setup(dummy_env, EmptyProblemStatement())
+        await agent.setup(dummy_env, EmptyProblemStatement())
         assert agent.token_manager is new_tm
 
 

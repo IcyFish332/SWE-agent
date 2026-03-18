@@ -106,33 +106,33 @@ class SWEEnv:
         hook.on_init(env=self)
         self._chook.add_hook(hook)
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Start the environment and reset it to a clean state."""
-        self._init_deployment()
-        self.reset()
+        await self._init_deployment()
+        await self.reset()
         for command in self._post_startup_commands:
-            self.communicate(command, check="raise", timeout=self.post_startup_command_timeout)
+            await self.communicate(command, check="raise", timeout=self.post_startup_command_timeout)
 
-    def _copy_repo(self) -> None:
+    async def _copy_repo(self) -> None:
         """Clone/copy repository/codebase in container"""
         if self.repo is None:
             return
 
-        folders = self.communicate(input="ls", check="raise").split("\n")
+        folders = (await self.communicate(input="ls", check="raise")).split("\n")
         if self.repo.repo_name in folders:
             return
 
         self._chook.on_copy_repo_started(repo=self.repo)
-        self.repo.copy(self.deployment)
+        await self.repo.copy(self.deployment)
 
-    def hard_reset(self):
+    async def hard_reset(self):
         """Resets the environment and deployment, i.e., completely restarts the
         deployment.
         """
-        self.close()
-        self.start()
+        await self.close()
+        await self.start()
 
-    def reset(self):
+    async def reset(self):
         """Reset the environment to a clean state.
         Gets called by `start`, but can also be called independently to reset the
         environment to a clean state before a new attempt.
@@ -141,12 +141,12 @@ class SWEEnv:
             observation: output from container
             info: additional information (e.g. debugging information)
         """
-        self.communicate(input="cd /", check="raise")
-        self._copy_repo()
-        self._reset_repository()
+        await self.communicate(input="cd /", check="raise")
+        await self._copy_repo()
+        await self._reset_repository()
         self._chook.on_environment_startup()
 
-    def _reset_repository(self) -> None:
+    async def _reset_repository(self) -> None:
         """Clean repository of any modifications + Checkout base commit"""
         if self.repo is not None:
             self.logger.debug("Resetting repository %s to commit %s", self.repo.repo_name, self.repo.base_commit)
@@ -157,7 +157,7 @@ class SWEEnv:
                 "export ROOT=$(pwd -P)",
                 *self.repo.get_reset_commands(),
             ]
-            self.communicate(
+            await self.communicate(
                 input=" && ".join(startup_commands),
                 check="raise",
                 error_msg="Failed to clean repository",
@@ -165,36 +165,34 @@ class SWEEnv:
                 timeout=120,
             )
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Shutdown SWE-ReX deployment etc."""
         self.logger.info("Beginning environment shutdown...")
-        asyncio.run(self.deployment.stop())
+        await self.deployment.stop()
         self._chook.on_close()
 
     # MARK: Helper functions #
 
-    def _init_deployment(
+    async def _init_deployment(
         self,
     ) -> None:
         """Handles container initialization. Defines container name and creates it.
         If cached_image is provided, it will use that image name instead of the default.
         """
         self._chook.on_start_deployment()
-        asyncio.run(self.deployment.start())
-        asyncio.run(
-            self.deployment.runtime.create_session(
-                CreateBashSessionRequest(startup_source=["/root/.bashrc"], startup_timeout=10)
-            )
+        await self.deployment.start()
+        await self.deployment.runtime.create_session(
+            CreateBashSessionRequest(startup_source=["/root/.bashrc"], startup_timeout=10)
         )
-        self.set_env_variables({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PIP_PROGRESS_BAR": "off", "PAGER": "cat"})
+        await self.set_env_variables({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PIP_PROGRESS_BAR": "off", "PAGER": "cat"})
         self.logger.info("Environment Initialized")
 
-    def interrupt_session(self):
+    async def interrupt_session(self):
         self.logger.info("Interrupting session")
-        asyncio.run(self.deployment.runtime.run_in_session(BashInterruptAction()))
+        await self.deployment.runtime.run_in_session(BashInterruptAction())
 
     # todo: return exit code?
-    def communicate(
+    async def communicate(
         self,
         input: str,
         timeout: int | float = 25,
@@ -217,8 +215,8 @@ class SWEEnv:
         """
         self.logger.log(logging.TRACE, "Input:\n%s", input)  # type: ignore
         rex_check = "silent" if check else "ignore"
-        r = asyncio.run(
-            self.deployment.runtime.run_in_session(BashAction(command=input, timeout=timeout, check=rex_check))
+        r = await self.deployment.runtime.run_in_session(
+            BashAction(command=input, timeout=timeout, check=rex_check)
         )
         output = r.output
         self.logger.log(logging.TRACE, "Output:\n%s", output)  # type: ignore
@@ -227,11 +225,11 @@ class SWEEnv:
             msg = f"Command {input!r} failed ({r.exit_code=}): {error_msg}"
             self.logger.error(msg)
             if check == "raise":
-                self.close()
+                await self.close()
                 raise RuntimeError(msg)
         return output
 
-    def read_file(self, path: str | PurePath, encoding: str | None = None, errors: str | None = None) -> str:
+    async def read_file(self, path: str | PurePath, encoding: str | None = None, errors: str | None = None) -> str:
         """Read file contents from container
 
         Args:
@@ -244,25 +242,25 @@ class SWEEnv:
         Returns:
             file_contents: Contents of file as string
         """
-        r = asyncio.run(
-            self.deployment.runtime.read_file(ReadFileRequest(path=str(path), encoding=encoding, errors=errors))
+        r = await self.deployment.runtime.read_file(
+            ReadFileRequest(path=str(path), encoding=encoding, errors=errors)
         )
         return r.content
 
-    def write_file(self, path: str | PurePath, content: str) -> None:
+    async def write_file(self, path: str | PurePath, content: str) -> None:
         """Write content to file in container"""
-        asyncio.run(self.deployment.runtime.write_file(WriteFileRequest(path=str(path), content=content)))
+        await self.deployment.runtime.write_file(WriteFileRequest(path=str(path), content=content))
 
-    def set_env_variables(self, env_variables: dict[str, str]) -> None:
+    async def set_env_variables(self, env_variables: dict[str, str]) -> None:
         """Set environment variables in the environment."""
         if not env_variables:
             self.logger.debug("No environment variables to set")
             return
         _env_setters = [f"export {k}={shlex.quote(str(v))}" for k, v in env_variables.items()]
         command = " && ".join(_env_setters)
-        self.communicate(command, check="raise")
+        await self.communicate(command, check="raise")
 
-    def execute_command(
+    async def execute_command(
         self,
         command: str,
         shell: bool = True,
@@ -271,6 +269,6 @@ class SWEEnv:
         cwd: str | None = None,
     ) -> None:
         """Execute a command in the environment independent of the session (i.e., as a subprocess)"""
-        asyncio.run(
-            self.deployment.runtime.execute(RexCommand(command=command, shell=shell, check=check, env=env, cwd=cwd))
+        await self.deployment.runtime.execute(
+            RexCommand(command=command, shell=shell, check=check, env=env, cwd=cwd)
         )

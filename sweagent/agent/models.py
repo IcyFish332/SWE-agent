@@ -1,26 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
 import random
 import shlex
-import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from threading import Lock
 from typing import Annotated, Any, Iterable, Literal, Optional
 
-import requests
+import httpx
 import litellm
 import litellm.types.utils
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict, Field, SecretStr
 from swerex.exceptions import SwerexException
 from tenacity import (
+    AsyncRetrying,
     RetryCallState,
-    Retrying,
     retry_if_not_exception_type,
     stop_after_attempt,
     wait_random_exponential,
@@ -51,8 +50,8 @@ except ImportError:
 litellm.suppress_debug_info = True
 
 
-_THREADS_THAT_USED_API_KEYS = []
-"""Keeps track of thread orders so that we can choose the same API key for the same thread."""
+_TASKS_THAT_USED_API_KEYS: list[str] = []
+"""Keeps track of asyncio task names so that we can choose the same API key for the same task."""
 
 
 class RetryConfig(PydanticBaseModel):
@@ -182,13 +181,14 @@ class GenericAPIModelConfig(PydanticBaseModel):
             return None
         if not self.choose_api_key_by_thread:
             return random.choice(api_keys)
-        thread_name = threading.current_thread().name
-        if thread_name not in _THREADS_THAT_USED_API_KEYS:
-            _THREADS_THAT_USED_API_KEYS.append(thread_name)
-        thread_idx = _THREADS_THAT_USED_API_KEYS.index(thread_name)
-        key_idx = thread_idx % len(api_keys)
+        task = asyncio.current_task()
+        task_name = task.get_name() if task else "no-task"
+        if task_name not in _TASKS_THAT_USED_API_KEYS:
+            _TASKS_THAT_USED_API_KEYS.append(task_name)
+        task_idx = _TASKS_THAT_USED_API_KEYS.index(task_name)
+        key_idx = task_idx % len(api_keys)
         get_logger("config", emoji="🔧").debug(
-            f"Choosing API key {key_idx} for thread {thread_name} (idx {thread_idx})"
+            f"Choosing API key {key_idx} for task {task_name} (idx {task_idx})"
         )
         return api_keys[key_idx]
 
@@ -300,7 +300,7 @@ GLOBAL_STATS = GlobalStats()
 Please use the `GLOBAL_STATS_LOCK` lock when accessing this object to avoid race conditions.
 """
 
-GLOBAL_STATS_LOCK = Lock()
+GLOBAL_STATS_LOCK = asyncio.Lock()
 """Lock for accessing `GLOBAL_STATS` without race conditions"""
 
 
@@ -333,7 +333,7 @@ class AbstractModel(ABC):
         self.stats = InstanceStats()
 
     @abstractmethod
-    def query(self, history: History | list[int], action_prompt: str = "> ") -> dict: ...
+    async def query(self, history: History | list[int], action_prompt: str = "> ") -> dict: ...
 
     @property
     def instance_cost_limit(self) -> float:
@@ -437,7 +437,7 @@ class HumanModel(AbstractModel):
         self._update_stats()
         return {"message": action}
 
-    def query(self, history: History, action_prompt: str = "> ", n: int | None = None, **kwargs) -> dict | list[dict]:
+    async def query(self, history: History, action_prompt: str = "> ", n: int | None = None, **kwargs) -> dict | list[dict]:
         """Wrapper to separate action prompt from formatting"""
         out = []
         n_samples = n or 1
@@ -460,7 +460,7 @@ class HumanModel(AbstractModel):
 
 
 class HumanThoughtModel(HumanModel):
-    def query(self, history: History, **kwargs) -> dict:
+    async def query(self, history: History, **kwargs) -> dict:
         """Logic for handling user input (both thought + action) to pass to SWEEnv"""
         thought_all = ""
         thought = input("Thought (end w/ END_THOUGHT): ")
@@ -503,7 +503,7 @@ class ReplayModel(AbstractModel):
         self._replay_idx += 1
         self._action_idx = 0
 
-    def query(self, history: History) -> dict:
+    async def query(self, history: History) -> dict:
         """Logic for tracking which replay action to pass to SWEEnv"""
         self.stats.api_calls += 1
         actions = self._replays[self._replay_idx]
@@ -549,7 +549,7 @@ class PredeterminedTestModel(AbstractModel):
         self._idx = -1
         self.stats = InstanceStats()
 
-    def query(self, *args, **kwargs) -> dict:
+    async def query(self, *args, **kwargs) -> dict:
         self._idx += 1
         output = self._outputs[self._idx]
         if isinstance(output, str):
@@ -572,8 +572,8 @@ class InstantEmptySubmitTestModel(AbstractModel):
         self.stats = InstanceStats()
         self._action_idx = 0
 
-    def query(self, history: list[dict[str, str]]) -> dict:
-        time.sleep(random.uniform(0, self.config.delay))
+    async def query(self, history: list[dict[str, str]]) -> dict:
+        await asyncio.sleep(random.uniform(0, self.config.delay))
         # Need to at least do _something_ to submit
         if self._action_idx == 0:
             self._action_idx = 1
@@ -645,8 +645,8 @@ class LiteLLMModel(AbstractModel):
         """Cost limit for the model. Returns 0 if there is no limit."""
         return self.config.per_instance_cost_limit
 
-    def _update_stats(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
-        with GLOBAL_STATS_LOCK:
+    async def _update_stats(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
+        async with GLOBAL_STATS_LOCK:
             GLOBAL_STATS.total_cost += cost
         self.stats.instance_cost += cost
         self.stats.tokens_sent += input_tokens
@@ -685,17 +685,17 @@ class LiteLLMModel(AbstractModel):
             msg = "Per instance call limit exceeded"
             raise InstanceCallLimitExceededError(msg)
 
-    def _sleep(self) -> None:
+    async def _sleep(self) -> None:
         elapsed_time = time.time() - GLOBAL_STATS.last_query_timestamp
         if elapsed_time < self.config.delay:
-            time.sleep(self.config.delay - elapsed_time)
-        with GLOBAL_STATS_LOCK:
+            await asyncio.sleep(self.config.delay - elapsed_time)
+        async with GLOBAL_STATS_LOCK:
             GLOBAL_STATS.last_query_timestamp = time.time()
 
-    def _single_query(
+    async def _single_query(
         self, messages: list[dict[str, str]], n: int | None = None, temperature: float | None = None
     ) -> list[dict]:
-        self._sleep()
+        await self._sleep()
         # Workaround for litellm bug https://github.com/SWE-agent/SWE-agent/issues/1109
         messages_no_cache_control = copy.deepcopy(messages)
         for message in messages_no_cache_control:
@@ -793,21 +793,21 @@ class LiteLLMModel(AbstractModel):
             ):
                 output_dict["thinking_blocks"] = response.choices[i].message.thinking_blocks  # type: ignore
             outputs.append(output_dict)
-        self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
+        await self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
         return outputs
 
-    def _query(
+    async def _query(
         self, messages: list[dict[str, str]], n: int | None = None, temperature: float | None = None
     ) -> list[dict]:
         if n is None:
-            return self._single_query(messages, temperature=temperature)
+            return await self._single_query(messages, temperature=temperature)
         outputs = []
         # not needed for openai, but oh well.
         for _ in range(n):
-            outputs.extend(self._single_query(messages))
+            outputs.extend(await self._single_query(messages))
         return outputs
 
-    def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
+    async def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
         messages = self._history_to_messages(history)
 
         def retry_warning(retry_state: RetryCallState):
@@ -822,7 +822,7 @@ class LiteLLMModel(AbstractModel):
                 f"{exception_info}"
             )
 
-        for attempt in Retrying(
+        async for attempt in AsyncRetrying(
             stop=stop_after_attempt(self.config.retry.retries),
             wait=wait_random_exponential(min=self.config.retry.min_wait, max=self.config.retry.max_wait),
             reraise=True,
@@ -848,7 +848,7 @@ class LiteLLMModel(AbstractModel):
             before_sleep=retry_warning,
         ):
             with attempt:
-                result = self._query(messages, n=n, temperature=temperature)
+                result = await self._query(messages, n=n, temperature=temperature)
         if n is None or n == 1:
             return result[0]
         return result
@@ -913,8 +913,8 @@ class SGLangModel(AbstractModel):
         self.token_manager.reset()
         self._processed_message_count = 0
 
-    def _update_stats(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
-        with GLOBAL_STATS_LOCK:
+    async def _update_stats(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
+        async with GLOBAL_STATS_LOCK:
             GLOBAL_STATS.total_cost += cost
         self.stats.instance_cost += cost
         self.stats.tokens_sent += input_tokens
@@ -929,11 +929,11 @@ class SGLangModel(AbstractModel):
         if 0 < self.config.per_instance_call_limit < self.stats.api_calls:
             raise InstanceCallLimitExceededError("Per instance call limit exceeded")
 
-    def _sleep(self) -> None:
+    async def _sleep(self) -> None:
         elapsed_time = time.time() - GLOBAL_STATS.last_query_timestamp
         if elapsed_time < self.config.delay:
-            time.sleep(self.config.delay - elapsed_time)
-        with GLOBAL_STATS_LOCK:
+            await asyncio.sleep(self.config.delay - elapsed_time)
+        async with GLOBAL_STATS_LOCK:
             GLOBAL_STATS.last_query_timestamp = time.time()
 
     def _build_headers(self, api_key: str | None) -> dict[str, str]:
@@ -942,7 +942,7 @@ class SGLangModel(AbstractModel):
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
-    def _raise_for_http_error(self, error: requests.HTTPError) -> None:
+    def _raise_for_http_error(self, error: httpx.HTTPStatusError) -> None:
         response = error.response
         if response is None:
             raise error
@@ -1136,8 +1136,8 @@ class SGLangModel(AbstractModel):
                 out.append(float(item))
         return out or None
 
-    def _single_query(self, history: History, n: int | None = None, temperature: float | None = None) -> list[dict]:
-        self._sleep()
+    async def _single_query(self, history: History, n: int | None = None, temperature: float | None = None) -> list[dict]:
+        await self._sleep()
         new_prompt_token_ids = self.tokenize_prompt_messages(history)
         self._validate_incremental_tokens(history, new_prompt_token_ids)
         input_ids = self.token_manager.token_ids + (new_prompt_token_ids or [])
@@ -1160,14 +1160,15 @@ class SGLangModel(AbstractModel):
         api_key = self.config.choose_api_key()
         headers = self._build_headers(api_key)
         try:
-            response = requests.post(
-                f"{self.config.api_base}/generate",
-                json=payload,
-                headers=headers,
-                timeout=self.config.completion_kwargs.get("timeout", 1800),
-            )
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.config.api_base}/generate",
+                    json=payload,
+                    headers=headers,
+                    timeout=self.config.completion_kwargs.get("timeout", 1800),
+                )
             response.raise_for_status()
-        except requests.HTTPError as error:
+        except httpx.HTTPStatusError as error:
             self._raise_for_http_error(error)
         data = response.json()
 
@@ -1217,18 +1218,18 @@ class SGLangModel(AbstractModel):
             output["tool_calls"] = parsed["tool_calls"]
         if parsed.get("reasoning_content"):
             output["reasoning_content"] = parsed["reasoning_content"]
-        self._update_stats(input_tokens=input_tokens, output_tokens=len(output_tokens), cost=0.0)
+        await self._update_stats(input_tokens=input_tokens, output_tokens=len(output_tokens), cost=0.0)
         return [output]
 
-    def _query(self, history: History, n: int | None = None, temperature: float | None = None) -> list[dict]:
+    async def _query(self, history: History, n: int | None = None, temperature: float | None = None) -> list[dict]:
         if n is None:
-            return self._single_query(history, temperature=temperature)
+            return await self._single_query(history, temperature=temperature)
         outputs: list[dict[str, Any]] = []
         for _ in range(n):
-            outputs.extend(self._single_query(history, temperature=temperature))
+            outputs.extend(await self._single_query(history, temperature=temperature))
         return outputs
 
-    def query(self, history: History | list[int], n: int = 1, temperature: float | None = None) -> list[dict] | dict:
+    async def query(self, history: History | list[int], n: int = 1, temperature: float | None = None) -> list[dict] | dict:
         if not history:
             message_history: History = []
         elif isinstance(history[0], dict):
@@ -1246,7 +1247,7 @@ class SGLangModel(AbstractModel):
                 f"(slept for {retry_state.idle_for:.2f}s){exception_info}"
             )
 
-        for attempt in Retrying(
+        async for attempt in AsyncRetrying(
             stop=stop_after_attempt(self.config.retry.retries),
             wait=wait_random_exponential(min=self.config.retry.min_wait, max=self.config.retry.max_wait),
             reraise=True,
@@ -1266,7 +1267,7 @@ class SGLangModel(AbstractModel):
             before_sleep=retry_warning,
         ):
             with attempt:
-                result = self._query(message_history, n=n, temperature=temperature)
+                result = await self._query(message_history, n=n, temperature=temperature)
 
         if n is None or n == 1:
             return result[0]

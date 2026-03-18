@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
-import requests
 from pydantic import SecretStr
 
 from sweagent.agent.models import (
@@ -221,11 +221,12 @@ class TestBuildPayload:
 # _raise_for_http_error
 # ---------------------------------------------------------------------------
 class TestRaiseForHttpError:
-    def _make_http_error(self, message: str, status_code: int = 400) -> requests.HTTPError:
-        response = MagicMock()
-        response.json.return_value = {"error": message}
-        response.status_code = status_code
-        error = requests.HTTPError(response=response)
+    def _make_http_error(self, message: str, status_code: int = 400) -> httpx.HTTPStatusError:
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"error": message}
+        mock_response.status_code = status_code
+        mock_request = MagicMock()
+        error = httpx.HTTPStatusError(message, request=mock_request, response=mock_response)
         return error
 
     def test_context_length_error(self, model):
@@ -255,13 +256,17 @@ class TestRaiseForHttpError:
 
     def test_generic_error_reraises(self, model):
         error = self._make_http_error("some random server error")
-        with pytest.raises(requests.HTTPError):
+        with pytest.raises(httpx.HTTPStatusError):
             model._raise_for_http_error(error)
 
     def test_no_response_reraises(self, model):
-        error = requests.HTTPError()
+        mock_request = MagicMock()
+        mock_response = MagicMock()
+        mock_response.json.side_effect = ValueError("no body")
+        mock_response.text = "error"
+        error = httpx.HTTPStatusError("error", request=mock_request, response=mock_response)
         error.response = None
-        with pytest.raises(requests.HTTPError):
+        with pytest.raises(httpx.HTTPStatusError):
             model._raise_for_http_error(error)
 
 
@@ -405,111 +410,125 @@ class TestValidateIncrementalTokens:
 
 
 # ---------------------------------------------------------------------------
-# _single_query (requires mocking requests.post and parse_response)
+# _single_query (requires mocking httpx.AsyncClient and parse_response)
 # ---------------------------------------------------------------------------
 class TestSingleQuery:
-    @patch("sweagent.agent.models.time")
-    @patch("sweagent.agent.models.requests.post")
-    def test_successful_query(self, mock_post, mock_time, model):
-        mock_time.time.return_value = 1000.0
+    def _make_mock_client(self, mock_resp):
+        """Create a mock httpx.AsyncClient that returns mock_resp from post()."""
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_successful_query(self, model):
         mock_resp = MagicMock()
         mock_resp.json.return_value = _make_sglang_response(
             input_logprobs=[[0.0, i] for i in [10, 20, 30, 40, 50]]
         )
-        mock_resp.raise_for_status.return_value = None
-        mock_post.return_value = mock_resp
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = self._make_mock_client(mock_resp)
 
-        with patch.object(model, "parse_response", return_value={"message": "response text"}):
-            history = History([{"role": "user", "content": "hello"}])
-            result = model._single_query(history)
+        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
+            with patch.object(model, "_sleep", new_callable=AsyncMock):
+                with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                    with patch.object(model, "parse_response", return_value={"message": "response text"}):
+                        history = History([{"role": "user", "content": "hello"}])
+                        result = await model._single_query(history)
 
         assert len(result) == 1
         assert result[0]["message"] == "response text"
         assert result[0]["output_tokens"] == [101, 102, 103]
         assert len(result[0]["rollout_log_probs"]) == 3
 
-    @patch("sweagent.agent.models.time")
-    @patch("sweagent.agent.models.requests.post")
-    def test_updates_token_manager(self, mock_post, mock_time, model):
-        mock_time.time.return_value = 1000.0
+    @pytest.mark.asyncio
+    async def test_updates_token_manager(self, model):
         mock_resp = MagicMock()
         mock_resp.json.return_value = _make_sglang_response(
             input_logprobs=[[0.0, i] for i in [10, 20, 30, 40, 50]]
         )
-        mock_resp.raise_for_status.return_value = None
-        mock_post.return_value = mock_resp
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = self._make_mock_client(mock_resp)
 
-        with patch.object(model, "parse_response", return_value={"message": "text"}):
-            history = History([{"role": "user", "content": "hello"}])
-            model._single_query(history)
+        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
+            with patch.object(model, "_sleep", new_callable=AsyncMock):
+                with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                    with patch.object(model, "parse_response", return_value={"message": "text"}):
+                        history = History([{"role": "user", "content": "hello"}])
+                        await model._single_query(history)
 
         # Token manager should have prompt + response segments
         assert len(model.token_manager) > 0
         assert model.token_manager.segment_info[0][0] is False  # prompt
         assert model.token_manager.segment_info[1][0] is True   # response
 
-    @patch("sweagent.agent.models.time")
-    @patch("sweagent.agent.models.requests.post")
-    def test_updates_processed_message_count(self, mock_post, mock_time, model):
-        mock_time.time.return_value = 1000.0
+    @pytest.mark.asyncio
+    async def test_updates_processed_message_count(self, model):
         mock_resp = MagicMock()
         mock_resp.json.return_value = _make_sglang_response()
-        mock_resp.raise_for_status.return_value = None
-        mock_post.return_value = mock_resp
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = self._make_mock_client(mock_resp)
 
-        with patch.object(model, "parse_response", return_value={"message": "text"}):
-            history = History([{"role": "user", "content": "hello"}])
-            model._single_query(history)
+        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
+            with patch.object(model, "_sleep", new_callable=AsyncMock):
+                with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                    with patch.object(model, "parse_response", return_value={"message": "text"}):
+                        history = History([{"role": "user", "content": "hello"}])
+                        await model._single_query(history)
 
         # Should be len(history) + 1 = 2
         assert model._processed_message_count == 2
 
-    def test_context_exceeded_before_http(self, model, mock_tokenizer):
+    @pytest.mark.asyncio
+    async def test_context_exceeded_before_http(self, model, mock_tokenizer):
         model.model_max_input_tokens = 3  # very small limit
         mock_tokenizer.apply_chat_template.return_value = [1, 2, 3, 4, 5]  # 5 tokens > 3
         history = History([{"role": "user", "content": "hello"}])
-        with pytest.raises(ContextWindowExceededError):
-            model._single_query(history)
+        with patch.object(model, "_sleep", new_callable=AsyncMock):
+            with pytest.raises(ContextWindowExceededError):
+                await model._single_query(history)
 
-    @patch("sweagent.agent.models.time")
-    @patch("sweagent.agent.models.requests.post")
-    def test_logprob_padding_when_shorter(self, mock_post, mock_time, model):
-        mock_time.time.return_value = 1000.0
+    @pytest.mark.asyncio
+    async def test_logprob_padding_when_shorter(self, model):
         mock_resp = MagicMock()
         mock_resp.json.return_value = _make_sglang_response(
             output_ids=[101, 102, 103],
             output_logprobs=[[-0.1, 101]],  # only 1 logprob for 3 tokens
         )
-        mock_resp.raise_for_status.return_value = None
-        mock_post.return_value = mock_resp
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = self._make_mock_client(mock_resp)
 
-        with patch.object(model, "parse_response", return_value={"message": "text"}):
-            result = model._single_query(History([{"role": "user", "content": "hello"}]))
+        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
+            with patch.object(model, "_sleep", new_callable=AsyncMock):
+                with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                    with patch.object(model, "parse_response", return_value={"message": "text"}):
+                        result = await model._single_query(History([{"role": "user", "content": "hello"}]))
 
         # Should be padded to 3
         assert len(result[0]["rollout_log_probs"]) == 3
 
-    @patch("sweagent.agent.models.time")
-    @patch("sweagent.agent.models.requests.post")
-    def test_logprob_truncation_when_longer(self, mock_post, mock_time, model):
-        mock_time.time.return_value = 1000.0
+    @pytest.mark.asyncio
+    async def test_logprob_truncation_when_longer(self, model):
         mock_resp = MagicMock()
         mock_resp.json.return_value = _make_sglang_response(
             output_ids=[101],
             output_logprobs=[[-0.1, 101], [-0.2, 102], [-0.3, 103]],  # 3 logprobs for 1 token
         )
-        mock_resp.raise_for_status.return_value = None
-        mock_post.return_value = mock_resp
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = self._make_mock_client(mock_resp)
 
-        with patch.object(model, "parse_response", return_value={"message": "text"}):
-            result = model._single_query(History([{"role": "user", "content": "hello"}]))
+        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
+            with patch.object(model, "_sleep", new_callable=AsyncMock):
+                with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                    with patch.object(model, "parse_response", return_value={"message": "text"}):
+                        result = await model._single_query(History([{"role": "user", "content": "hello"}]))
 
         assert len(result[0]["rollout_log_probs"]) == 1
 
-    @patch("sweagent.agent.models.time")
-    @patch("sweagent.agent.models.requests.post")
-    def test_parse_response_integration(self, mock_post, mock_time, model):
-        """_single_query without mocking parse_response: text → real parser → tool_calls."""
+    @pytest.mark.asyncio
+    async def test_parse_response_integration(self, model):
+        """_single_query without mocking parse_response: text -> real parser -> tool_calls."""
         # Discover a valid tool_call_parser name from the installed sglang
         try:
             from sglang.srt.function_call.function_call_parser import FunctionCallParser as _FCP
@@ -546,7 +565,6 @@ class TestSingleQuery:
             }
         ]
 
-        mock_time.time.return_value = 1000.0
         # Simulate SGLang returning hermes-format tool call text
         tool_call_text = '<tool_call>{"name": "bash", "arguments": {"command": "ls -la"}}</tool_call>'
         mock_resp = MagicMock()
@@ -555,12 +573,15 @@ class TestSingleQuery:
             output_ids=[201, 202, 203],
             output_logprobs=[[-0.1, 201], [-0.2, 202], [-0.3, 203]],
         )
-        mock_resp.raise_for_status.return_value = None
-        mock_post.return_value = mock_resp
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = self._make_mock_client(mock_resp)
 
-        # NO mock on parse_response — real parser runs
-        history = History([{"role": "user", "content": "list files"}])
-        result = model._single_query(history)
+        # NO mock on parse_response -- real parser runs
+        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
+            with patch.object(model, "_sleep", new_callable=AsyncMock):
+                with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                    history = History([{"role": "user", "content": "list files"}])
+                    result = await model._single_query(history)
 
         assert len(result) == 1
         r = result[0]
@@ -574,19 +595,20 @@ class TestSingleQuery:
         parsed_args = json.loads(r["tool_calls"][0]["function"]["arguments"])
         assert parsed_args["command"] == "ls -la"
 
-    @patch("sweagent.agent.models.time")
-    @patch("sweagent.agent.models.requests.post")
-    def test_non_list_output_ids_handled(self, mock_post, mock_time, model):
-        mock_time.time.return_value = 1000.0
+    @pytest.mark.asyncio
+    async def test_non_list_output_ids_handled(self, model):
         mock_resp = MagicMock()
         data = _make_sglang_response()
         data["output_ids"] = "not a list"
         mock_resp.json.return_value = data
-        mock_resp.raise_for_status.return_value = None
-        mock_post.return_value = mock_resp
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = self._make_mock_client(mock_resp)
 
-        with patch.object(model, "parse_response", return_value={"message": "text"}):
-            result = model._single_query(History([{"role": "user", "content": "hello"}]))
+        with patch("sweagent.agent.models.httpx.AsyncClient", return_value=mock_client):
+            with patch.object(model, "_sleep", new_callable=AsyncMock):
+                with patch.object(model, "_update_stats", new_callable=AsyncMock):
+                    with patch.object(model, "parse_response", return_value={"message": "text"}):
+                        result = await model._single_query(History([{"role": "user", "content": "hello"}]))
 
         assert result[0]["output_tokens"] == []
 
@@ -595,28 +617,23 @@ class TestSingleQuery:
 # query (public entry point)
 # ---------------------------------------------------------------------------
 class TestQuery:
-    @patch("sweagent.agent.models.time")
-    @patch("sweagent.agent.models.requests.post")
-    def test_n1_returns_dict(self, mock_post, mock_time, model):
-        mock_time.time.return_value = 1000.0
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = _make_sglang_response()
-        mock_resp.raise_for_status.return_value = None
-        mock_post.return_value = mock_resp
-
-        with patch.object(model, "parse_response", return_value={"message": "text"}):
-            result = model.query(History([{"role": "user", "content": "hello"}]), n=1)
+    @pytest.mark.asyncio
+    async def test_n1_returns_dict(self, model):
+        with patch.object(model, "_single_query", new_callable=AsyncMock, return_value=[{"message": "text"}]):
+            result = await model.query(History([{"role": "user", "content": "hello"}]), n=1)
 
         assert isinstance(result, dict)
 
-    def test_empty_history(self, model):
-        # Empty history with token_manager empty -> should call _tokenize_messages with []
+    @pytest.mark.asyncio
+    async def test_empty_history(self, model):
+        # Empty history with token_manager empty -> should call _single_query with []
         # This tests the query dispatch, not the full HTTP flow
-        with patch.object(model, "_single_query", return_value=[{"message": "ok"}]) as mock_sq:
-            result = model.query(History([]), n=1)
+        with patch.object(model, "_single_query", new_callable=AsyncMock, return_value=[{"message": "ok"}]) as mock_sq:
+            result = await model.query(History([]), n=1)
             mock_sq.assert_called_once()
             assert result == {"message": "ok"}
 
-    def test_invalid_history_type_raises(self, model):
+    @pytest.mark.asyncio
+    async def test_invalid_history_type_raises(self, model):
         with pytest.raises(TypeError, match="message history"):
-            model.query([1, 2, 3], n=1)
+            await model.query([1, 2, 3], n=1)

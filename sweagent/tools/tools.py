@@ -249,19 +249,19 @@ class ToolHandler:
     # Installation & Reset
     # --------------------
 
-    def install(self, env: SWEEnv) -> None:
-        self._install_commands(env)
-        self.reset(env)
+    async def install(self, env: SWEEnv) -> None:
+        await self._install_commands(env)
+        await self.reset(env)
 
-    def reset(self, env: SWEEnv) -> None:
+    async def reset(self, env: SWEEnv) -> None:
         self.logger.info("Resetting tools")
         env_variables = self.config.env_variables.copy() | {
             var: os.getenv(var) for var in self.config.propagate_env_variables
         }
-        env.set_env_variables(env_variables)
-        env.write_file("/root/.swe-agent-env", json.dumps(self.config.registry_variables))
-        env.write_file("/root/state.json", "{}")
-        env.communicate(" && ".join(self._reset_commands), check="raise", timeout=self.config.install_timeout)
+        await env.set_env_variables(env_variables)
+        await env.write_file("/root/.swe-agent-env", json.dumps(self.config.registry_variables))
+        await env.write_file("/root/state.json", "{}")
+        await env.communicate(" && ".join(self._reset_commands), check="raise", timeout=self.config.install_timeout)
 
     async def _upload_bundles(self, env: SWEEnv) -> None:
         await asyncio.gather(
@@ -289,11 +289,11 @@ class ToolHandler:
             *(self._is_command_available(env, command.name, env_vars) for command in self.config.commands)
         )
 
-    def _install_commands(self, env: SWEEnv) -> None:
+    async def _install_commands(self, env: SWEEnv) -> None:
         """Make sure all commands are available in the container"""
-        env.set_env_variables(self.config.env_variables)
-        cwd = env.communicate("pwd", check="raise").strip()
-        asyncio.run(self._upload_bundles(env))
+        await env.set_env_variables(self.config.env_variables)
+        cwd = (await env.communicate("pwd", check="raise")).strip()
+        await self._upload_bundles(env)
         for bundle in self.config.bundles:
             cmds = [
                 f"export PATH=/root/tools/{bundle.path.name}/bin:$PATH",
@@ -302,22 +302,22 @@ class ToolHandler:
             if (bundle.path / "install.sh").exists():
                 cmds.append(f"cd /root/tools/{bundle.path.name} && source install.sh")
             cmds.append(f"chmod +x /root/tools/{bundle.path.name}/bin/*")
-            env.communicate(
+            await env.communicate(
                 " && ".join(cmds),
                 check="raise",
                 timeout=self.config.install_timeout,
             )
-        env.communicate(f"cd {cwd}", check="raise")
-        path = env.communicate("echo $PATH", check="raise").strip()
-        asyncio.run(self._check_available_commands(env, {"PATH": path}))
+        await env.communicate(f"cd {cwd}", check="raise")
+        path = (await env.communicate("echo $PATH", check="raise")).strip()
+        await self._check_available_commands(env, {"PATH": path})
 
     # Getting state
     # -------------
 
-    def _get_state(self, env: SWEEnv) -> dict[str, str]:
+    async def _get_state(self, env: SWEEnv) -> dict[str, str]:
         """Retrieve the state from the environment"""
         try:
-            state_str = env.read_file("/root/state.json")
+            state_str = await env.read_file("/root/state.json")
         except FileNotFoundError:
             self.logger.warning("State file not found, returning empty state")
             return {}
@@ -334,7 +334,7 @@ class ToolHandler:
             raise ValueError(msg)
         return state
 
-    def get_state(self, env: SWEEnv) -> dict[str, str]:
+    async def get_state(self, env: SWEEnv) -> dict[str, str]:
         """Execute state commands from all bundles and combine their results.
         This can be used to extract environment variables etc. from the environment.
         """
@@ -342,8 +342,8 @@ class ToolHandler:
             return self.mock_state
 
         for state_command in self.config.state_commands:
-            env.communicate(state_command, check="warn")
-        combined_state = self._get_state(env)
+            await env.communicate(state_command, check="warn")
+        combined_state = await self._get_state(env)
         self.logger.debug(f"Retrieved state from environment: {combined_state}")
         return combined_state
 

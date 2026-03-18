@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import subprocess
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -110,23 +111,23 @@ def dummy_env_args() -> EnvironmentConfig:
 @pytest.fixture
 def dummy_env(dummy_env_args) -> Generator[SWEEnv, None, None]:
     env = SWEEnv.from_config(dummy_env_args)
-    env.start()
+    asyncio.get_event_loop().run_until_complete(env.start())
     yield env
-    env.close()
+    asyncio.get_event_loop().run_until_complete(env.close())
 
 
-@contextmanager
-def swe_env_context(env_args):
-    """Context manager to make sure we close the shell on the container
+@asynccontextmanager
+async def swe_env_context(env_args):
+    """Async context manager to make sure we close the shell on the container
     so that we can reuse it.
     """
 
     env = SWEEnv.from_config(env_args)
-    env.start()
+    await env.start()
     try:
         yield env
     finally:
-        env.close()
+        await env.close()
 
 
 @pytest.fixture
