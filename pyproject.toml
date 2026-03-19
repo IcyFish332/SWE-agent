@@ -57,7 +57,8 @@ dependencies = [
     "litellm",
     "GitPython",
     "ghapi",
-    "swe-rex>=1.4.0",
+    # swe-rex is provided via editable install from 3rdparty/SWE-ReX (team fork with K8s support).
+    # Do NOT re-add "swe-rex>=1.4.0" here — it would pull upstream from PyPI and overwrite K8sDeploymentConfig.
     "tabulate",
     "textual>=1.0.0",
     "requests",
