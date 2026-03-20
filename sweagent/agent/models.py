@@ -1196,9 +1196,9 @@ class SGLangModel(AbstractModel):
         if output_tokens:
             self.token_manager.add_response(output_tokens, output_logprobs)
 
-        routed_experts = data.get("meta_info", {}).get("routed_experts") or []
-        if not isinstance(routed_experts, list):
-            routed_experts = []
+        routed_experts = data.get("meta_info", {}).get("routed_experts")
+        if routed_experts is None:
+            routed_experts = ""
 
         text = data.get("text", "")
         if not isinstance(text, str):
