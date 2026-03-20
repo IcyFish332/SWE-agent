@@ -1331,7 +1331,7 @@ class RLTokenAgent(DefaultAgent):
         self.state = state
         self.token_manager = getattr(model, "token_manager", TokenManager())
         self.init_input_ids: list[int] = []
-        self._routed_experts_segments: list[str] = []
+        self._routed_experts_raw: str = ""
         self._error_logs: list[dict[str, Any]] = []
 
     def _require_tokenizer(self):
@@ -1352,9 +1352,14 @@ class RLTokenAgent(DefaultAgent):
         return self.token_manager.logprobs
 
     @property
-    def routed_experts_segments(self) -> list[str]:
-        """Raw base64-encoded routed_experts from each SGLang query, in order."""
-        return self._routed_experts_segments
+    def routed_experts_raw(self) -> str:
+        """Raw base64-encoded routed_experts from the last SGLang query.
+
+        Each query sends the full accumulated input_ids, so the last query's
+        routed_experts covers the entire token sequence. slime's
+        fill_routing_replay expects shape (seq_len-1, num_layers, top_k).
+        """
+        return self._routed_experts_raw
 
     def _append_history(self, item: dict[str, Any]) -> None:
         self._chook.on_query_message_added(**item)
@@ -1453,7 +1458,7 @@ class RLTokenAgent(DefaultAgent):
             step.rollout_log_probs = output.get("rollout_log_probs", []) or []
             step.rollout_routed_experts = output.get("rollout_routed_experts", "") or ""
             if step.rollout_routed_experts:
-                self._routed_experts_segments.append(step.rollout_routed_experts)
+                self._routed_experts_raw = step.rollout_routed_experts
             step.thought, step.action = self.tools.parse_actions(output)
             if output.get("tool_calls") is not None:
                 step.tool_call_ids = [call["id"] for call in output["tool_calls"]]
