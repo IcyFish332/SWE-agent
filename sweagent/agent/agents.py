@@ -1377,7 +1377,7 @@ class RLTokenAgent(DefaultAgent):
             model.reset_rollout_state()
         self.token_manager = getattr(model, "token_manager", self.token_manager)
         self.init_input_ids = []
-        self._routed_experts_segments = []
+        self._routed_experts_raw = ""
         self._error_logs = []
 
         await super().setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
