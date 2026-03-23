@@ -906,6 +906,7 @@ class SGLangModel(AbstractModel):
         self._processed_message_count = 0
         self._http_client = httpx.AsyncClient(
             timeout=self.config.completion_kwargs.get("timeout", 1800),
+            transport=httpx.AsyncHTTPTransport(retries=2),
         )
 
     @property

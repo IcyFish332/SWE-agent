@@ -1461,9 +1461,9 @@ class RLTokenAgent(DefaultAgent):
             step.thinking_blocks = output.get("thinking_blocks", [])
             step.reasoning_content = output.get("reasoning_content", None)
             step.rollout_log_probs = output.get("rollout_log_probs", []) or []
-            step.rollout_routed_experts = output.get("rollout_routed_experts", "") or ""
-            if step.rollout_routed_experts:
-                self._routed_experts_raw = step.rollout_routed_experts
+            raw_experts = output.get("rollout_routed_experts", "") or ""
+            if raw_experts:
+                self._routed_experts_raw = raw_experts
             step.thought, step.action = self.tools.parse_actions(output)
             if output.get("tool_calls") is not None:
                 step.tool_call_ids = [call["id"] for call in output["tool_calls"]]

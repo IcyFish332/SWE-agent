@@ -79,7 +79,7 @@ class TestInit:
         assert rl_agent.init_input_ids == []
 
     def test_rollout_routed_experts_empty(self, rl_agent):
-        assert rl_agent.rollout_routed_experts == []
+        assert rl_agent.routed_experts_raw == ""
 
     def test_error_logs_empty(self, rl_agent):
         assert rl_agent._error_logs == []
@@ -121,13 +121,13 @@ class TestSetup:
         from sweagent.agent.problem_statement import EmptyProblemStatement
 
         rl_agent.init_input_ids = [1, 2, 3]
-        rl_agent.rollout_routed_experts = [[1], [2]]
+        rl_agent._routed_experts_raw = "some_base64_data"
         rl_agent._error_logs = [{"error": "test"}]
 
         await rl_agent.setup(dummy_env, EmptyProblemStatement())
 
         assert rl_agent.init_input_ids == []
-        assert rl_agent.rollout_routed_experts == []
+        assert rl_agent.routed_experts_raw == ""
         assert rl_agent._error_logs == []
 
     @pytest.mark.asyncio
