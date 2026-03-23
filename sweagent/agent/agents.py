@@ -1365,6 +1365,11 @@ class RLTokenAgent(DefaultAgent):
         self._chook.on_query_message_added(**item)
         self.history.append(item)  # type: ignore[arg-type]
 
+    def save_trajectory(self) -> None:
+        """No-op in RL mode — trajectory data is returned via AgentRunResult,
+        persistence is handled by slime's rollout data saver."""
+        pass
+
 
     async def setup(
         self,
@@ -1658,7 +1663,6 @@ class RLTokenAgent(DefaultAgent):
             self.save_trajectory()
         self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
 
-        self.logger.info("Trajectory saved to %s", self.traj_path)
         data = self.get_trajectory_data()
         data["info"]["error_logs"] = self._error_logs
         data["info"]["response_turn"] = len(self.trajectory)
