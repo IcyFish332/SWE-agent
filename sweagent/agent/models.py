@@ -270,6 +270,8 @@ class SGLangModelConfig(GenericAPIModelConfig):
     message_separator: str = ""
     debug_check_incremental_tokens: bool = False
     return_routed_experts: bool = False
+    routing_key: str | None = None
+    """Routing key for consistent-hashing router policy (sent as X-SMG-Routing-Key header)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -944,6 +946,8 @@ class SGLangModel(AbstractModel):
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        if self.config.routing_key:
+            headers["X-SMG-Routing-Key"] = self.config.routing_key
         return headers
 
     def _raise_for_http_error(self, error: httpx.HTTPStatusError) -> None:
