@@ -27,15 +27,18 @@ class Repo(Protocol):
     def get_reset_commands(self) -> list[str]: ...
 
 
-def _get_git_reset_commands(base_commit: str) -> list[str]:
-    return [
-        "git fetch",
+def _get_git_reset_commands(base_commit: str, skip_fetch: bool = False) -> list[str]:
+    cmds = []
+    if not skip_fetch:
+        cmds.append("git fetch")
+    cmds.extend([
         "git status",
         "git restore .",
         "git reset --hard",
         f"git checkout {shlex.quote(base_commit)}",
         "git clean -fdq",
-    ]
+    ])
+    return cmds
 
 
 class PreExistingRepoConfig(BaseModel):
@@ -60,6 +63,9 @@ class PreExistingRepoConfig(BaseModel):
     reset: bool = True
     """If True, reset the repository to the base commit after the copy operation."""
 
+    skip_fetch: bool = False
+    """If True, skip 'git fetch' during reset (for images with local-only repos like SWE-Factory)."""
+
     model_config = ConfigDict(extra="forbid")
 
     async def copy(self, deployment: AbstractDeployment):
@@ -69,7 +75,7 @@ class PreExistingRepoConfig(BaseModel):
     def get_reset_commands(self) -> list[str]:
         """Issued after the copy operation or when the environment is reset."""
         if self.reset:
-            return _get_git_reset_commands(self.base_commit)
+            return _get_git_reset_commands(self.base_commit, skip_fetch=self.skip_fetch)
         return []
 
 
