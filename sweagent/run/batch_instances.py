@@ -11,6 +11,7 @@ from swerex.deployment.config import (
     DeploymentConfig,
     DockerDeploymentConfig,
     DummyDeploymentConfig,
+    InspireSandboxDeploymentConfig,
     LocalDeploymentConfig,
 )
 from typing_extensions import Self
@@ -27,6 +28,83 @@ from sweagent.utils.github import _is_repo_private
 from sweagent.utils.log import get_logger
 
 logger = get_logger("swea-config", emoji="🔧")
+
+
+# ---------------------------------------------------------------------------
+# Inspire Sandbox: image_name → template mapping
+# ---------------------------------------------------------------------------
+_INSPIRE_DEFAULT_REGISTRY = "docker-qb.sii.edu.cn/inspire-studio"
+
+
+def _inspire_sandbox_image_from_docker(docker_image: str) -> str:
+    """Convert a Docker Hub SWE-bench image name to an Inspire platform image URL.
+
+    Example:
+        ``docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest``
+        → ``docker-qb.sii.edu.cn/inspire-studio/sweb.eval.x86_64.astropy_1776_astropy-12907``
+    """
+    image = docker_image
+    # Strip registry prefix (docker.io/, ghcr.io/, etc.)
+    parts = image.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        parts = parts[1:]
+    image = "/".join(parts)
+    # Strip namespace (e.g. "swebench/")
+    if "/" in image:
+        image = image.split("/", 1)[1]
+    # Strip tag
+    if ":" in image:
+        image = image.rsplit(":", 1)[0]
+    return f"{_INSPIRE_DEFAULT_REGISTRY}/{image}"
+
+
+def _inspire_sandbox_template_name(image: str, spec_code: str) -> str:
+    """Generate a deterministic, platform-safe template name from an image URL."""
+    import getpass
+    import hashlib
+
+    user = re.sub(r"[^a-z0-9-]+", "-", getpass.getuser().lower()).strip("-") or "user"
+    digest = hashlib.sha1(f"{image}|{spec_code}".encode(), usedforsecurity=False).hexdigest()[:12]
+    # Extract the instance slug from the image name (last path component)
+    slug = image.rsplit("/", 1)[-1] if "/" in image else image
+    slug = re.sub(r"[^a-z0-9-]+", "-", slug.lower())[:48].strip("-")
+    spec_slug = spec_code.replace(".", "-")
+    return f"{user}-swa-{slug}-{spec_slug}-{digest}"
+
+
+def _inspire_sandbox_template_from_image(
+    docker_image: str,
+    deployment: "InspireSandboxDeploymentConfig",
+) -> str:
+    """Build (or reuse) an Inspire Sandbox template for the given Docker image.
+
+    Returns the template name to assign to ``deployment.template``.
+    """
+    from inspire_sandbox import SandboxSpecCode, Template, default_build_logger
+
+    inspire_image = _inspire_sandbox_image_from_docker(docker_image)
+    spec_code = getattr(deployment, "_inspire_spec_code", "g.c4")
+    template_name = _inspire_sandbox_template_name(inspire_image, spec_code)
+
+    api_params: dict[str, Any] = {}
+    if deployment.api_key:
+        api_params["api_key"] = deployment.api_key
+    if deployment.api_url:
+        api_params["api_url"] = deployment.api_url
+
+    if Template.exists(template_name, **api_params):
+        return template_name
+
+    logger.info("Building template %s from image %s", template_name, inspire_image)
+    template = Template().from_image(inspire_image)
+    Template.build(
+        template,
+        template_name,
+        spec_code=SandboxSpecCode(spec_code),
+        on_build_logs=default_build_logger(min_level="info"),
+        **api_params,
+    )
+    return template_name
 
 
 class AbstractInstanceSource(ABC):
@@ -148,7 +226,10 @@ class SimpleBatchInstance(BaseModel):
                 env=EnvironmentConfig(deployment=deployment, repo=repo), problem_statement=problem_statement
             )
 
-        deployment.image = self.image_name  # type: ignore
+        if isinstance(deployment, InspireSandboxDeploymentConfig):
+            deployment.template = _inspire_sandbox_template_from_image(self.image_name, deployment)
+        else:
+            deployment.image = self.image_name  # type: ignore
 
         if isinstance(deployment, DockerDeploymentConfig) and deployment.python_standalone_dir is None:
             # Note: you can disable this by setting python_standalone_dir to ""
@@ -400,7 +481,10 @@ class SWESmithInstances(BaseModel, AbstractInstanceSource):
 
         for instance_dict in instance_dicts:
             deployment = self.deployment.model_copy(deep=True)
-            deployment.image = instance_dict["image_name"]  # type: ignore
+            if isinstance(deployment, InspireSandboxDeploymentConfig):
+                deployment.template = _inspire_sandbox_template_from_image(instance_dict["image_name"], deployment)
+            else:
+                deployment.image = instance_dict["image_name"]  # type: ignore
 
             if isinstance(deployment, DockerDeploymentConfig) and deployment.python_standalone_dir is None:
                 deployment.python_standalone_dir = "/root"  # type: ignore
