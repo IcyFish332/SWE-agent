@@ -59,17 +59,25 @@ def _inspire_sandbox_image_from_docker(docker_image: str) -> str:
 
 
 def _inspire_sandbox_template_name(image: str, spec_code: str) -> str:
-    """Generate a deterministic, platform-safe template name from an image URL."""
-    import getpass
-    import hashlib
+    """Generate a deterministic, platform-safe template name from an image URL.
 
-    user = re.sub(r"[^a-z0-9-]+", "-", getpass.getuser().lower()).strip("-") or "user"
-    digest = hashlib.sha1(f"{image}|{spec_code}".encode(), usedforsecurity=False).hexdigest()[:12]
-    # Extract the instance slug from the image name (last path component)
+    The name is derived directly from the image slug (last path component)
+    with all non-alphanumeric characters replaced by ``-``, plus a spec-code
+    suffix.  This makes the name human-readable, unique per image+spec, and
+    consistent across SWE-agent / SWE-bench so both can share templates.
+
+    Example::
+
+        docker-qb.sii.edu.cn/inspire-studio/sweb.eval.x86_64.django_1776_django-11149
+        → swebench-sweb-eval-x86-64-django-1776-django-11149-g-c4
+    """
+    # Extract the last path component (image slug)
     slug = image.rsplit("/", 1)[-1] if "/" in image else image
-    slug = re.sub(r"[^a-z0-9-]+", "-", slug.lower())[:48].strip("-")
+    # Sanitize: only lowercase alphanumeric and hyphens allowed
+    slug = re.sub(r"[^a-z0-9-]+", "-", slug.lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
     spec_slug = spec_code.replace(".", "-")
-    return f"{user}-swa-{slug}-{spec_slug}-{digest}"
+    return f"swebench-{slug}-{spec_slug}"
 
 
 def _inspire_sandbox_template_from_image(
