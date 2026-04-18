@@ -91,7 +91,7 @@ def _inspire_sandbox_template_from_image(
     from inspire_sandbox import SandboxSpecCode, Template, default_build_logger
 
     inspire_image = _inspire_sandbox_image_from_docker(docker_image)
-    spec_code = getattr(deployment, "_inspire_spec_code", "g.c4")
+    spec_code = deployment.spec_code
     template_name = _inspire_sandbox_template_name(inspire_image, spec_code)
 
     api_params: dict[str, Any] = {}
