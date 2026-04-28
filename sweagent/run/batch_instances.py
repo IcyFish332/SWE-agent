@@ -63,21 +63,24 @@ def _inspire_sandbox_template_name(image: str, spec_code: str) -> str:
 
     The name is derived directly from the image slug (last path component)
     with all non-alphanumeric characters replaced by ``-``, plus a spec-code
-    suffix.  This makes the name human-readable, unique per image+spec, and
+    suffix and a bootstrap-contract version (``TEMPLATE_NAME_SUFFIX``).
+    This makes the name human-readable, unique per image+spec, and
     consistent across SWE-agent / SWE-bench so both can share templates.
 
     Example::
 
         docker-qb.sii.edu.cn/inspire-studio/sweb.eval.x86_64.django_1776_django-11149
-        → swebench-sweb-eval-x86-64-django-1776-django-11149-g-c4
+        → swebench-sweb-eval-x86-64-django-1776-django-11149-g-c4-rex1
     """
+    from swerex.deployment.inspire_sandbox import TEMPLATE_NAME_SUFFIX
+
     # Extract the last path component (image slug)
     slug = image.rsplit("/", 1)[-1] if "/" in image else image
     # Sanitize: only lowercase alphanumeric and hyphens allowed
     slug = re.sub(r"[^a-z0-9-]+", "-", slug.lower())
     slug = re.sub(r"-{2,}", "-", slug).strip("-")
     spec_slug = spec_code.replace(".", "-")
-    return f"swebench-{slug}-{spec_slug}"
+    return f"swebench-{slug}-{spec_slug}-{TEMPLATE_NAME_SUFFIX}"
 
 
 def _inspire_sandbox_template_from_image(
@@ -86,9 +89,18 @@ def _inspire_sandbox_template_from_image(
 ) -> str:
     """Build (or reuse) an Inspire Sandbox template for the given Docker image.
 
+    The template bakes the SWE-ReX install + start command into its
+    ``set_start_cmd`` layer so that sandboxes spawned from it have
+    ``swerex-remote`` already listening on port ``swerex_port`` — no
+    post-create ``commands.run`` bootstrap is required.
+
     Returns the template name to assign to ``deployment.template``.
     """
     from inspire_sandbox import SandboxSpecCode, Template, default_build_logger
+    from swerex.deployment.inspire_sandbox import (
+        append_swerex_bootstrap,
+        derive_swerex_auth_token,
+    )
 
     inspire_image = _inspire_sandbox_image_from_docker(docker_image)
     spec_code = deployment.spec_code
@@ -104,7 +116,18 @@ def _inspire_sandbox_template_from_image(
         return template_name
 
     logger.info("Building template %s from image %s", template_name, inspire_image)
-    template = Template().from_image(inspire_image)
+    token = deployment.swerex_auth_token or derive_swerex_auth_token(
+        template_name, deployment.api_key
+    )
+    template = append_swerex_bootstrap(
+        Template().from_image(inspire_image),
+        token=token,
+        swerex_bin=deployment.swerex_bin,
+        swerex_port=deployment.swerex_port,
+        apt_source_url=deployment.apt_source_url,
+        pypi_index_url=deployment.pypi_index_url,
+        pypi_trusted_hosts=list(deployment.pypi_trusted_hosts),
+    )
     Template.build(
         template,
         template_name,
