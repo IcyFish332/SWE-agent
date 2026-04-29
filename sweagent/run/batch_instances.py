@@ -176,21 +176,36 @@ def _slice_spec_to_slice(slice_spec: str) -> slice:
 def _filter_batch_items(
     instances: list[BatchInstance], *, filter_: str, slice_: str = "", shuffle: bool = False
 ) -> list[BatchInstance]:
+    return _filter_by_id(
+        instances,
+        key=lambda x: x.problem_statement.id,
+        filter_=filter_,
+        slice_=slice_,
+        shuffle=shuffle,
+    )
+
+
+def _filter_by_id(items, *, key, filter_: str, slice_: str = "", shuffle: bool = False):
+    """Shared shuffle/filter/slice for anything with a stable id extracted via ``key``.
+
+    Apply this BEFORE any expensive per-item work (e.g., building an Inspire Sandbox
+    template from the image name) so only the survivors pay the cost.
+    """
     if shuffle:
-        instances = sorted(instances.copy(), key=lambda x: x.problem_statement.id)
+        items = sorted(items, key=key)
         random.seed(42)
-        random.shuffle(instances)
-    before_filter = len(instances)
-    instances = [instance for instance in instances if re.match(filter_, instance.problem_statement.id)]
-    after_filter = len(instances)
+        random.shuffle(items)
+    before_filter = len(items)
+    items = [item for item in items if re.match(filter_, key(item))]
+    after_filter = len(items)
     if before_filter != after_filter:
         logger.info("Instance filter: %d -> %d instances", before_filter, after_filter)
     if slice_:
-        instances = instances[_slice_spec_to_slice(slice_)]
-        after_slice = len(instances)
+        items = items[_slice_spec_to_slice(slice_)]
+        after_slice = len(items)
         if before_filter != after_slice:
             logger.info("Instance slice: %d -> %d instances", before_filter, after_slice)
-    return instances
+    return items
 
 
 class SimpleBatchInstance(BaseModel):
@@ -333,8 +348,14 @@ class InstancesFromFile(BaseModel, AbstractInstanceSource):
     def get_instance_configs(self) -> list[BatchInstance]:
         instance_dicts = load_file(self.path)
         simple_instances = [SimpleBatchInstance.model_validate(instance_dict) for instance_dict in instance_dicts]
-        instances = [instance.to_full_batch_instance(self.deployment) for instance in simple_instances]
-        return _filter_batch_items(instances, filter_=self.filter, slice_=self.slice, shuffle=self.shuffle)
+        simple_instances = _filter_by_id(
+            simple_instances,
+            key=lambda x: x.instance_id,
+            filter_=self.filter,
+            slice_=self.slice,
+            shuffle=self.shuffle,
+        )
+        return [instance.to_full_batch_instance(self.deployment) for instance in simple_instances]
 
     @property
     def id(self) -> str:
@@ -370,8 +391,14 @@ class InstancesFromHuggingFace(BaseModel, AbstractInstanceSource):
 
         ds: list[dict[str, Any]] = load_dataset(self.dataset_name, split=self.split)  # type: ignore
         simple_instances: list[SimpleBatchInstance] = [SimpleBatchInstance.model_validate(instance) for instance in ds]
-        instances = [instance.to_full_batch_instance(self.deployment) for instance in simple_instances]
-        return _filter_batch_items(instances, filter_=self.filter, slice_=self.slice, shuffle=self.shuffle)
+        simple_instances = _filter_by_id(
+            simple_instances,
+            key=lambda x: x.instance_id,
+            filter_=self.filter,
+            slice_=self.slice,
+            shuffle=self.shuffle,
+        )
+        return [instance.to_full_batch_instance(self.deployment) for instance in simple_instances]
 
     @property
     def id(self) -> str:
@@ -441,10 +468,15 @@ class SWEBenchInstances(BaseModel, AbstractInstanceSource):
         if isinstance(self.deployment, DockerDeploymentConfig):
             self.deployment.platform = "linux/amd64"
 
-        instances = [
-            SimpleBatchInstance.from_swe_bench(instance).to_full_batch_instance(self.deployment) for instance in ds
-        ]
-        return _filter_batch_items(instances, filter_=self.filter, slice_=self.slice, shuffle=self.shuffle)
+        simple_instances = [SimpleBatchInstance.from_swe_bench(instance) for instance in ds]
+        simple_instances = _filter_by_id(
+            simple_instances,
+            key=lambda x: x.instance_id,
+            filter_=self.filter,
+            slice_=self.slice,
+            shuffle=self.shuffle,
+        )
+        return [instance.to_full_batch_instance(self.deployment) for instance in simple_instances]
 
     @property
     def id(self) -> str:
@@ -508,6 +540,13 @@ class SWESmithInstances(BaseModel, AbstractInstanceSource):
         github_token = os.getenv("GITHUB_TOKEN", "")
 
         instance_dicts = load_file(self.path)
+        instance_dicts = _filter_by_id(
+            instance_dicts,
+            key=lambda d: d["instance_id"],
+            filter_=self.filter,
+            slice_=self.slice,
+            shuffle=self.shuffle,
+        )
         instances = []
 
         for instance_dict in instance_dicts:
@@ -552,7 +591,7 @@ class SWESmithInstances(BaseModel, AbstractInstanceSource):
                 )
             )
 
-        return _filter_batch_items(instances, filter_=self.filter, slice_=self.slice, shuffle=self.shuffle)
+        return instances
 
     @property
     def id(self) -> str:
