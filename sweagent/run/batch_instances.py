@@ -116,9 +116,7 @@ def _inspire_sandbox_template_from_image(
         return template_name
 
     logger.info("Building template %s from image %s", template_name, inspire_image)
-    token = deployment.swerex_auth_token or derive_swerex_auth_token(
-        template_name, deployment.api_key
-    )
+    token = deployment.swerex_auth_token or derive_swerex_auth_token(template_name)
     template = append_swerex_bootstrap(
         Template().from_image(inspire_image),
         token=token,
